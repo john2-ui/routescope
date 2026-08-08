@@ -5,3 +5,4 @@ target/
 data/
 build/
 dist/
+tmp/

@@ -39,7 +39,7 @@ RouteScope 是一个部署在 Linux 软路由上的网络流量观测与统计�
 网络控制面：nftables + conntrack
 域名归因：本地 DNS 代理
 存储：SQLite（首版）
-服务端：Rust 或 Go
+服务端：Rust
 eBPF 程序：C + libbpf + CO-RE
 ```
 
