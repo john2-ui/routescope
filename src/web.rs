@@ -8,6 +8,7 @@ use axum::{
 };
 
 use crate::auth;
+use crate::state::AppState;
 
 #[derive(Template)]
 #[template(path = "login.html")]
@@ -25,19 +26,19 @@ struct DevicesTemplate;
 #[template(path = "device_detail.html")]
 struct DeviceDetailTemplate;
 
-pub fn public_routes() -> Router {
+pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/login", get(login_page).post(login))
         .route("/logout", post(logout))
         .route("/static/app.css", get(stylesheet))
 }
 
-pub fn protected_routes() -> Router {
+pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/", get(dashboard))
         .route("/devices", get(devices))
         .route("/devices/{mac_address}", get(device_detail))
-        .route_layer(middleware::from_fn(auth::require_admin))
+        .route_layer(middleware::from_fn_with_state(state, auth::require_admin))
 }
 
 async fn login_page() -> Result<Html<String>, StatusCode> {

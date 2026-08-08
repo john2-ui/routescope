@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 
 pub type TimestampMs = i64;
 
+/// Floor a timestamp to the start of its UTC minute bucket.
+pub fn floor_to_minute_ms(ts: TimestampMs) -> TimestampMs {
+    ts - ts.rem_euclid(60_000)
+}
+
 /// Stable identity for a LAN device. IP addresses are flow-time snapshots only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Device {
@@ -186,6 +191,26 @@ impl DomainConfidence {
     }
 }
 
+/// Per-device minute traffic bucket (LAN-client perspective).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceMinuteStat {
+    pub mac_address: String,
+    pub minute_ms: TimestampMs,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+}
+
+/// Per-device domain traffic summary for Top rankings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DomainTrafficSummary {
+    pub domain: String,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub total_bytes: u64,
+    pub source: DomainSource,
+    pub confidence: DomainConfidence,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +294,11 @@ mod tests {
         let encoded = serde_json::to_string(&original).unwrap();
         let decoded: Flow = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn floor_to_minute_aligns_to_bucket_start() {
+        assert_eq!(floor_to_minute_ms(61_234), 60_000);
+        assert_eq!(floor_to_minute_ms(60_000), 60_000);
     }
 }

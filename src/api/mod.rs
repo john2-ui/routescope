@@ -1,55 +1,107 @@
-use axum::{Json, Router, extract::Path, middleware, response::IntoResponse, routing::get};
-use serde::Serialize;
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    middleware,
+    response::IntoResponse,
+    routing::get,
+};
 
 use crate::auth;
+use crate::domain::{Device, DeviceMinuteStat, DomainTrafficSummary, Flow};
+use crate::state::AppState;
 
-#[derive(Serialize)]
-struct TodoResponse {
-    status: &'static str,
-    message: &'static str,
-}
-
-pub fn public_routes() -> Router {
+pub fn public_routes() -> Router<AppState> {
     Router::new().route("/healthz", get(health_check))
 }
 
-pub fn protected_routes() -> Router {
+pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/{mac_address}", get(device_detail))
         .route("/api/v1/devices/{mac_address}/traffic", get(device_traffic))
         .route("/api/v1/devices/{mac_address}/flows", get(device_flows))
         .route("/api/v1/devices/{mac_address}/domains", get(device_domains))
-        .route_layer(middleware::from_fn(auth::require_admin))
+        .route_layer(middleware::from_fn_with_state(state, auth::require_admin))
 }
 
 async fn health_check() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-async fn list_devices() -> Json<TodoResponse> {
-    todo_response("Device discovery and statistics are not implemented.")
-}
-
-async fn device_detail(Path(_mac_address): Path<String>) -> Json<TodoResponse> {
-    todo_response("Device detail lookup is not implemented.")
-}
-
-async fn device_traffic(Path(_mac_address): Path<String>) -> Json<TodoResponse> {
-    todo_response("Minute traffic aggregation is not implemented.")
-}
-
-async fn device_flows(Path(_mac_address): Path<String>) -> Json<TodoResponse> {
-    todo_response("Flow collection and retention are not implemented.")
-}
-
-async fn device_domains(Path(_mac_address): Path<String>) -> Json<TodoResponse> {
-    todo_response("DNS and SNI domain attribution are not implemented.")
-}
-
-fn todo_response(message: &'static str) -> Json<TodoResponse> {
-    Json(TodoResponse {
-        status: "todo",
-        message,
+async fn list_devices(State(state): State<AppState>) -> Result<Json<Vec<Device>>, StatusCode> {
+    state.observation.devices().map(Json).map_err(|err| {
+        eprintln!("error listing failed: {err}");
+        StatusCode::INTERNAL_SERVER_ERROR
     })
+}
+
+async fn device_detail(
+    State(state): State<AppState>,
+    Path(mac_address): Path<String>,
+) -> Result<Json<Device>, StatusCode> {
+    match state.observation.device(&mac_address) {
+        Ok(Some(device)) => Ok(Json(device)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(err) => {
+            eprintln!("error finding device: {err}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn device_traffic(
+    State(state): State<AppState>,
+    Path(mac_address): Path<String>,
+) -> Result<Json<Vec<DeviceMinuteStat>>, StatusCode> {
+    require_device(&state, &mac_address)?;
+    state
+        .observation
+        .device_traffic(&mac_address)
+        .map(Json)
+        .map_err(|err| {
+            eprintln!("device_traffic failed: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn device_flows(
+    State(state): State<AppState>,
+    Path(mac_address): Path<String>,
+) -> Result<Json<Vec<Flow>>, StatusCode> {
+    require_device(&state, &mac_address)?;
+    state
+        .observation
+        .recent_flows(&mac_address)
+        .map(Json)
+        .map_err(|err| {
+            eprintln!("device_flows failed: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn device_domains(
+    State(state): State<AppState>,
+    Path(mac_address): Path<String>,
+) -> Result<Json<Vec<DomainTrafficSummary>>, StatusCode> {
+    require_device(&state, &mac_address)?;
+    state
+        .observation
+        .device_domain_top(&mac_address)
+        .map(Json)
+        .map_err(|err| {
+            eprintln!("device_domains failed: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+fn require_device(state: &AppState, mac_address: &str) -> Result<(), StatusCode> {
+    match state.observation.device(mac_address) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(err) => {
+            eprintln!("device lookup failed: {err}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }

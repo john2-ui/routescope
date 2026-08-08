@@ -1,9 +1,10 @@
 //! SQLite persistence: schema, repository, and retention cleanup.
 
 use crate::domain::{
-    ConnectionState, Device, DomainAttribution, DomainConfidence, DomainSource, Flow, FlowDirection,
+    ConnectionState, Device, DeviceMinuteStat, DomainAttribution, DomainConfidence, DomainSource,
+    DomainTrafficSummary, Flow, FlowDirection, floor_to_minute_ms,
 };
-use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
+use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, Transaction, params};
 use std::sync::Mutex;
 
 pub trait RouteScopeRepository: Send + Sync {
@@ -12,6 +13,17 @@ pub trait RouteScopeRepository: Send + Sync {
     fn list_devices(&self) -> SqliteResult<Vec<Device>>;
     fn find_device(&self, mac_address: &str) -> SqliteResult<Option<Device>>;
     fn list_recent_flows(&self, mac_address: &str) -> SqliteResult<Vec<Flow>>;
+    fn list_device_minute_stats(
+        &self,
+        mac_address: &str,
+        since_ms: i64,
+    ) -> SqliteResult<Vec<DeviceMinuteStat>>;
+    fn list_domain_traffic_top(
+        &self,
+        mac_address: &str,
+        since_ms: i64,
+        limit: usize,
+    ) -> SqliteResult<Vec<DomainTrafficSummary>>;
     fn delete_expired_data(
         &self,
         now_ms: i64,
@@ -113,6 +125,65 @@ impl SqliteRepository {
     }
 }
 
+fn add_device_minute_bytes(
+    tx: &Transaction<'_>,
+    mac_address: &str,
+    minute_ms: i64,
+    upload_bytes: u64,
+    download_bytes: u64,
+) -> SqliteResult<()> {
+    tx.execute(
+        r#"
+        INSERT INTO device_minute_stats
+            (mac_address, minute_ms, upload_bytes, download_bytes)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(mac_address, minute_ms) DO UPDATE SET
+            upload_bytes = upload_bytes + excluded.upload_bytes,
+            download_bytes = download_bytes + excluded.download_bytes
+        "#,
+        params![
+            mac_address,
+            minute_ms,
+            upload_bytes as i64,
+            download_bytes as i64
+        ],
+    )?;
+    Ok(())
+}
+
+fn add_domain_minute_bytes(
+    tx: &Transaction<'_>,
+    mac_address: &str,
+    attribution: &DomainAttribution,
+    minute_ms: i64,
+    upload_bytes: u64,
+    download_bytes: u64,
+) -> SqliteResult<()> {
+    tx.execute(
+        r#"
+        INSERT INTO domain_minute_stats
+            (mac_address, domain, minute_ms, upload_bytes, download_bytes,
+             domain_source, confidence)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(mac_address, domain, minute_ms) DO UPDATE SET
+            upload_bytes = upload_bytes + excluded.upload_bytes,
+            download_bytes = download_bytes + excluded.download_bytes,
+            domain_source = excluded.domain_source,
+            confidence = excluded.confidence
+        "#,
+        params![
+            mac_address,
+            attribution.domain,
+            minute_ms,
+            upload_bytes as i64,
+            download_bytes as i64,
+            attribution.source.as_str(),
+            attribution.confidence.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
 impl RouteScopeRepository for SqliteRepository {
     fn upsert_device(&self, device: &Device) -> SqliteResult<()> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
@@ -152,8 +223,26 @@ impl RouteScopeRepository for SqliteRepository {
                 None => (None, None, None, None, None),
             };
 
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        conn.execute(
+        let mut conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+        let tx = conn.transaction()?;
+
+        let previous: Option<(u64, u64)> = tx
+            .query_row(
+                "SELECT upload_bytes, download_bytes FROM flows WHERE flow_id = ?1",
+                params![flow.flow_id],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?;
+
+        let (delta_upload, delta_download) = match previous {
+            Some((prev_up, prev_down)) => (
+                flow.upload_bytes.saturating_sub(prev_up),
+                flow.download_bytes.saturating_sub(prev_down),
+            ),
+            None => (flow.upload_bytes, flow.download_bytes),
+        };
+
+        tx.execute(
             r#"
                 INSERT INTO flows (
                     flow_id, first_seen, last_seen, protocol, direction,
@@ -218,6 +307,29 @@ impl RouteScopeRepository for SqliteRepository {
                 flow.connection_state.as_str(),
             ],
         )?;
+
+        if delta_upload > 0 || delta_download > 0 {
+            let minute_ms = floor_to_minute_ms(flow.last_seen);
+            add_device_minute_bytes(
+                &tx,
+                &flow.client_mac,
+                minute_ms,
+                delta_upload,
+                delta_download,
+            )?;
+            if let Some(attribution) = &flow.domain {
+                add_domain_minute_bytes(
+                    &tx,
+                    &flow.client_mac,
+                    attribution,
+                    minute_ms,
+                    delta_upload,
+                    delta_download,
+                )?;
+            }
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -322,6 +434,96 @@ impl RouteScopeRepository for SqliteRepository {
                 domain,
                 connection_state: ConnectionState::parse(&state_raw)
                     .unwrap_or(ConnectionState::Unknown),
+            })
+        })?;
+        rows.collect()
+    }
+
+    fn list_device_minute_stats(
+        &self,
+        mac_address: &str,
+        since_ms: i64,
+    ) -> SqliteResult<Vec<DeviceMinuteStat>> {
+        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT mac_address, minute_ms, upload_bytes, download_bytes
+            FROM device_minute_stats
+            WHERE mac_address = ?1 AND minute_ms >= ?2
+            ORDER BY minute_ms ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![mac_address, since_ms], |row| {
+            Ok(DeviceMinuteStat {
+                mac_address: row.get(0)?,
+                minute_ms: row.get(1)?,
+                upload_bytes: row.get::<_, i64>(2)? as u64,
+                download_bytes: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    fn list_domain_traffic_top(
+        &self,
+        mac_address: &str,
+        since_ms: i64,
+        limit: usize,
+    ) -> SqliteResult<Vec<DomainTrafficSummary>> {
+        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                domain,
+                SUM(upload_bytes) AS upload_bytes,
+                SUM(download_bytes) AS download_bytes,
+                SUM(upload_bytes + download_bytes) AS total_bytes,
+                CASE MIN(
+                    CASE confidence
+                        WHEN 'high' THEN 0
+                        WHEN 'low' THEN 1
+                        ELSE 2
+                    END
+                )
+                    WHEN 0 THEN 'high'
+                    WHEN 1 THEN 'low'
+                    ELSE 'unknown'
+                END AS confidence,
+                (
+                    SELECT s.domain_source
+                    FROM domain_minute_stats s
+                    WHERE s.mac_address = domain_minute_stats.mac_address
+                      AND s.domain = domain_minute_stats.domain
+                      AND s.minute_ms >= ?2
+                    ORDER BY
+                        CASE s.confidence
+                            WHEN 'high' THEN 0
+                            WHEN 'low' THEN 1
+                            ELSE 2
+                        END ASC,
+                        s.minute_ms DESC
+                    LIMIT 1
+                ) AS domain_source
+            FROM domain_minute_stats
+            WHERE mac_address = ?1 AND minute_ms >= ?2
+            GROUP BY domain
+            ORDER BY total_bytes DESC
+            LIMIT ?3
+            "#,
+        )?;
+        let rows = stmt.query_map(params![mac_address, since_ms, limit as i64], |row| {
+            let confidence_raw: String = row.get(4)?;
+            let source_raw: String = row.get(5)?;
+            let upload_bytes = row.get::<_, i64>(1)? as u64;
+            let download_bytes = row.get::<_, i64>(2)? as u64;
+            Ok(DomainTrafficSummary {
+                domain: row.get(0)?,
+                upload_bytes,
+                download_bytes,
+                total_bytes: row.get::<_, i64>(3)? as u64,
+                source: DomainSource::parse(&source_raw).unwrap_or(DomainSource::Unknown),
+                confidence: DomainConfidence::parse(&confidence_raw)
+                    .unwrap_or(DomainConfidence::Unknown),
             })
         })?;
         rows.collect()
@@ -500,6 +702,73 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn upsert_flow_accumulates_minute_stats_by_delta() {
+        let repo = SqliteRepository::open_in_memory().unwrap();
+        let mac = "aa:bb:cc:dd:ee:ff";
+        let last_seen = 125_000i64; // minute bucket 120_000
+        let mut flow = sample_flow("flow-1", mac, last_seen);
+        flow.upload_bytes = 1_000;
+        flow.download_bytes = 2_000;
+
+        repo.upsert_flow(&flow).unwrap();
+
+        flow.upload_bytes = 1_500;
+        flow.download_bytes = 2_500;
+        repo.upsert_flow(&flow).unwrap();
+
+        let stats = repo.list_device_minute_stats(mac, 0).unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].minute_ms, 120_000);
+        assert_eq!(stats[0].upload_bytes, 1_500);
+        assert_eq!(stats[0].download_bytes, 2_500);
+
+        let domains = repo.list_domain_traffic_top(mac, 0, 10).unwrap();
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].domain, "example.com");
+        assert_eq!(domains[0].total_bytes, 4_000);
+        assert_eq!(domains[0].confidence, DomainConfidence::High);
+        assert_eq!(domains[0].source, DomainSource::Dns);
+    }
+
+    #[test]
+    fn domain_traffic_top_orders_by_total_bytes() {
+        let repo = SqliteRepository::open_in_memory().unwrap();
+        let mac = "aa:bb:cc:dd:ee:ff";
+        let now = 180_000i64;
+
+        let mut big = sample_flow("flow-big", mac, now);
+        big.domain = Some(DomainAttribution {
+            domain: "big.example".to_string(),
+            source: DomainSource::Dns,
+            confidence: DomainConfidence::High,
+            associated_at: now - 1_000,
+            expires_at: Some(now + 60_000),
+        });
+        big.upload_bytes = 9_000;
+        big.download_bytes = 1_000;
+        repo.upsert_flow(&big).unwrap();
+
+        let mut small = sample_flow("flow-small", mac, now);
+        small.client_port = 51_235;
+        small.domain = Some(DomainAttribution {
+            domain: "small.example".to_string(),
+            source: DomainSource::Sni,
+            confidence: DomainConfidence::Low,
+            associated_at: now - 1_000,
+            expires_at: Some(now + 60_000),
+        });
+        small.upload_bytes = 100;
+        small.download_bytes = 50;
+        repo.upsert_flow(&small).unwrap();
+
+        let top = repo.list_domain_traffic_top(mac, 0, 10).unwrap();
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].domain, "big.example");
+        assert_eq!(top[1].domain, "small.example");
+        assert_eq!(top[1].confidence, DomainConfidence::Low);
     }
 
     #[test]

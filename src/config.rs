@@ -6,6 +6,7 @@ pub struct Config {
     pub database_path: String,
     pub flow_retention_hours: u32,
     pub aggregate_retention_days: u32,
+    pub dev_bypass_auth: bool,
 }
 
 impl Config {
@@ -21,6 +22,9 @@ impl Config {
                 .unwrap_or_else(|_| "data/routescope.db".to_owned()),
             flow_retention_hours: 24,
             aggregate_retention_days: 30,
+            dev_bypass_auth: std::env::var("ROUTESCOPE_DEV_BYPASS_AUTH")
+                .map(|value| value == "1")
+                .unwrap_or(false),
         }
     }
 }
