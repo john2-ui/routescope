@@ -1,4 +1,4 @@
-.PHONY: run check test fmt seed smoke
+.PHONY: run check test fmt seed smoke namespace-up namespace-down namespace-status namespace-test
 
 run:
 	set -a && [ -f .env ] && . ./.env; set +a; cargo run
@@ -17,3 +17,15 @@ seed:
 
 smoke:
 	bash scripts/smoke_api.sh
+
+namespace-up:
+	scripts/namespace_lab.sh up
+
+namespace-down:
+	scripts/namespace_lab.sh down
+
+namespace-status:
+	scripts/namespace_lab.sh status
+
+namespace-test:
+	scripts/namespace_lab.sh test

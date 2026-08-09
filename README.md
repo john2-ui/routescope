@@ -34,6 +34,17 @@ make check
 make test
 ```
 
+Linux namespace 集成环境（需要 root、`iproute2`、`nftables`、`curl` 和 Python 3）：
+
+```bash
+sudo make namespace-up
+sudo make namespace-test
+sudo make namespace-down
+```
+
+该环境创建 `client-a/client-b → router → wan` 拓扑，验证两台客户端经
+IPv4 NAT 访问 WAN namespace 的 HTTP 服务。
+
 ## 项目结构
 
 ```text
@@ -44,6 +55,7 @@ src/domain.rs  Device、Flow 和域名归因领域模型
 src/service.rs 观测查询、Flow 写入和保留期清理
 src/storage.rs SQLite 仓储、分钟聚合与清理
 src/web.rs     服务端渲染页面与静态资源路由
+scripts/namespace_lab.sh namespace 拓扑创建、清理和 smoke test
 templates/     Askama HTML 模板
 static/        CSS 等静态资源
 config/        示例配置

@@ -248,7 +248,8 @@ TC eBPF + conntrack + 用户态聚合
 
 ## 11. 当前项目文件结构
 
-当前代码仅提供可启动的 Web 服务骨架；流量采集、持久化和认证逻辑均保留为 `TODO`，避免把空数据误认为真实观测数据。
+当前代码已实现领域模型、SQLite 持久化、分钟聚合、只读 API、可选模拟采集
+以及 Linux namespace NAT 集成环境；真实 TC eBPF、conntrack/DNS 采集和认证仍在后续阶段。
 
 ```text
 .
@@ -264,14 +265,16 @@ TC eBPF + conntrack + 用户态聚合
 ├── src/
 │   ├── main.rs                 # 服务启动、路由组装和路由测试
 │   ├── api/
-│   │   └── mod.rs              # 健康检查与受保护的 API 占位路由
+│   │   └── mod.rs              # 健康检查与受保护的只读 API 路由
 │   ├── auth.rs                 # 管理认证边界（TODO）
-│   ├── collector.rs            # TC eBPF、conntrack、DNS 采集接口（TODO）
+│   ├── collector.rs            # 真实采集接口与模拟采集器
 │   ├── config.rs               # 监听地址和保留期配置
 │   ├── domain.rs               # Device、Flow、域名归因领域模型
-│   ├── service.rs              # 观测用例服务（TODO）
-│   ├── storage.rs              # SQLite 仓储接口与清理边界（TODO）
+│   ├── service.rs              # 观测查询、Flow 写入与清理
+│   ├── storage.rs              # SQLite 仓储、聚合与清理
 │   └── web.rs                  # 服务端渲染页面和静态资源路由
+├── scripts/
+│   └── namespace_lab.sh        # namespace 拓扑与 NAT smoke test
 ├── templates/
 │   ├── login.html              # 登录页面骨架
 │   ├── dashboard.html          # 仪表盘空状态
