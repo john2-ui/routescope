@@ -9,6 +9,10 @@ pub struct Config {
     pub dev_bypass_auth: bool,
     pub simulator_enabled: bool,
     pub simulator_interval_secs: u64,
+    pub tc_ebpf_enabled: bool,
+    pub lan_interface: String,
+    pub wan_interface: String,
+    pub collector_interval_secs: u64,
 }
 
 impl Config {
@@ -32,6 +36,18 @@ impl Config {
                 .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             simulator_interval_secs: std::env::var("ROUTESCOPE_SIMULATOR_INTERVAL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(5),
+            tc_ebpf_enabled: std::env::var("ROUTESCOPE_ENABLE_TC_EBPF")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            lan_interface: std::env::var("ROUTESCOPE_LAN_INTERFACE")
+                .unwrap_or_else(|_| "br-lan".to_owned()),
+            wan_interface: std::env::var("ROUTESCOPE_WAN_INTERFACE")
+                .unwrap_or_else(|_| "eth0".to_owned()),
+            collector_interval_secs: std::env::var("ROUTESCOPE_COLLECT_INTERVAL_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .filter(|value| *value > 0)

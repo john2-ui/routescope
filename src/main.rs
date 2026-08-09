@@ -9,7 +9,7 @@ mod storage;
 mod web;
 
 use axum::Router;
-use collector::{FlowCollector, SimulatedCollector};
+use collector::{FlowCollector, SimulatedCollector, TcEbpfCollector};
 use config::Config;
 use service::ObservationService;
 use state::AppState;
@@ -43,19 +43,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let _retention_task = tokio::spawn(run_retention_cleanup_loop(Arc::clone(&observation)));
 
-    let _simulator_task = if config.simulator_enabled {
-        let collector: Arc<dyn FlowCollector> = Arc::new(SimulatedCollector::with_interval_secs(
-            config.simulator_interval_secs,
-        ));
+    if config.simulator_enabled && config.tc_ebpf_enabled {
+        return Err(
+            "ROUTESCOPE_ENABLE_SIMULATOR and ROUTESCOPE_ENABLE_TC_EBPF cannot both be enabled"
+                .into(),
+        );
+    }
 
-        Some(tokio::spawn(run_collection_loop(
-            Arc::clone(&observation),
-            collector,
+    let collector: Option<(Arc<dyn FlowCollector>, u64)> = if config.simulator_enabled {
+        Some((
+            Arc::new(SimulatedCollector::with_interval_secs(
+                config.simulator_interval_secs,
+            )),
             config.simulator_interval_secs,
-        )))
+        ))
+    } else if config.tc_ebpf_enabled {
+        Some((
+            Arc::new(TcEbpfCollector::new(
+                config.lan_interface.clone(),
+                config.wan_interface.clone(),
+            )?),
+            config.collector_interval_secs,
+        ))
     } else {
         None
     };
+
+    let _collector_task = collector.map(|(collector, interval_secs)| {
+        tokio::spawn(run_collection_loop(
+            Arc::clone(&observation),
+            collector,
+            interval_secs,
+        ))
+    });
 
     let state = AppState {
         observation,

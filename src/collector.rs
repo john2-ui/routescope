@@ -6,13 +6,28 @@ use crate::domain::{
     ConnectionState, CounterReset, DomainAttribution, DomainConfidence, DomainSource, Flow,
     FlowDirection,
 };
+use aya::{
+    Ebpf,
+    maps::HashMap as AyaHashMap,
+    programs::{
+        SchedClassifier, TcAttachType,
+        tc::{self, TcError},
+    },
+};
 use core::fmt;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::mem::MaybeUninit;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_SIMULATOR_INTERVAL_SECS: u64 = 5;
+const FLOW_IDLE_TIMEOUT_NS: u64 = 5 * 60 * 1_000_000_000;
+const TC_EBPF_OBJECT: &[u8] =
+    aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/routescope_tc.o"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -144,6 +159,32 @@ impl std::error::Error for CollectorFailure {}
 
 pub type CollectionResult = Result<CollectionBatch, CollectorFailure>;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct EbpfFlowKey {
+    client_mac: [u8; 6],
+    direction: u8,
+    protocol: u8,
+    client_ip: u32,
+    destination_ip: u32,
+    client_port: u16,
+    destination_port: u16,
+}
+
+unsafe impl aya::Pod for EbpfFlowKey {}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct EbpfFlowValue {
+    first_seen_ns: u64,
+    last_seen_ns: u64,
+    upload_bytes: u64,
+    download_bytes: u64,
+    packet_count: u64,
+}
+
+unsafe impl aya::Pod for EbpfFlowValue {}
+
 /// 流量采集器接口：提供数据源名称与一次采集结果。
 pub trait FlowCollector: Send + Sync {
     /// 返回采集器数据源名称。
@@ -196,29 +237,228 @@ fn validate_batch(source: &'static str, flows: Vec<Flow>) -> CollectionResult {
 /// 构造数据源不可用时的 Unhealthy 失败结果。
 #[allow(dead_code)]
 fn source_unavailable(source: &'static str, message: &str) -> CollectionResult {
-    let error = CollectorError::SourceUnavailable {
-        source,
-        message: message.to_owned(),
-    };
-
-    Err(CollectorFailure {
-        health: CollectorHealth::unhealthy(now_ms(), &error),
-        error,
-    })
+    Err(source_failure(source, message))
 }
 
-#[allow(dead_code)]
-pub struct TcEbpfCollector;
+fn source_failure(source: &'static str, message: impl Into<String>) -> CollectorFailure {
+    let error = CollectorError::SourceUnavailable {
+        source,
+        message: message.into(),
+    };
+
+    CollectorFailure {
+        health: CollectorHealth::unhealthy(now_ms(), &error),
+        error,
+    }
+}
+
+pub struct TcEbpfCollector {
+    ebpf: Mutex<Ebpf>,
+    lan_interface: String,
+    wan_interface: String,
+    session_id: u64,
+}
 
 impl FlowCollector for TcEbpfCollector {
-    /// 返回 TC eBPF 数据源名称。
     fn source_name(&self) -> &'static str {
         "tc-ebpf"
     }
 
-    /// TC eBPF 采集占位（尚未实现）。
     fn collect(&self) -> CollectionResult {
-        source_unavailable(self.source_name(), "collector is not implemented")
+        let observed_at_ms = now_ms();
+        let now_ns = monotonic_ns().map_err(|error| {
+            source_failure(
+                self.source_name(),
+                format!("failed to read monotonic clock: {error}"),
+            )
+        })?;
+
+        let mut ebpf = self
+            .ebpf
+            .lock()
+            .map_err(|_| source_failure(self.source_name(), "eBPF state mutex is poisoned"))?;
+
+        let map = ebpf
+            .map_mut("flow_stats")
+            .ok_or_else(|| source_failure(self.source_name(), "flow_stats map is missing"))?;
+        let mut stats: AyaHashMap<_, EbpfFlowKey, EbpfFlowValue> = AyaHashMap::try_from(map)
+            .map_err(|error| {
+                source_failure(
+                    self.source_name(),
+                    format!("failed to open flow_stats map: {error}"),
+                )
+            })?;
+
+        let entries = stats
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                source_failure(
+                    self.source_name(),
+                    format!("failed to read flow_stats map: {error}"),
+                )
+            })?;
+
+        let mut flows = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            if now_ns.saturating_sub(value.last_seen_ns) > FLOW_IDLE_TIMEOUT_NS {
+                stats.remove(&key).map_err(|error| {
+                    source_failure(
+                        self.source_name(),
+                        format!("failed to expire idle flow from BPF map: {error}"),
+                    )
+                })?;
+                continue;
+            }
+
+            flows.push(self.flow_from_entry(key, value, now_ns, observed_at_ms));
+        }
+
+        validate_batch(self.source_name(), flows)
+    }
+}
+
+impl TcEbpfCollector {
+    pub fn new(
+        lan_interface: impl Into<String>,
+        wan_interface: impl Into<String>,
+    ) -> Result<Self, CollectorFailure> {
+        let lan_interface = lan_interface.into();
+        let wan_interface = wan_interface.into();
+
+        if lan_interface.trim().is_empty() {
+            return Err(source_failure("tc-ebpf", "LAN interface must not be empty"));
+        }
+        if wan_interface.trim().is_empty() {
+            return Err(source_failure("tc-ebpf", "WAN interface must not be empty"));
+        }
+
+        let mut ebpf = Ebpf::load(TC_EBPF_OBJECT).map_err(|error| {
+            source_failure("tc-ebpf", format!("failed to load eBPF object: {error}"))
+        })?;
+
+        match tc::qdisc_add_clsact(&lan_interface) {
+            Ok(()) | Err(TcError::AlreadyAttached) => {}
+            Err(TcError::NetlinkError(error)) if error.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(error) => {
+                return Err(source_failure(
+                    "tc-ebpf",
+                    format!("failed to add clsact qdisc on {lan_interface}: {error}"),
+                ));
+            }
+        }
+
+        {
+            let program = ebpf
+                .program_mut("routescope_tc_ingress")
+                .ok_or_else(|| source_failure("tc-ebpf", "ingress program is missing"))?;
+            let program: &mut SchedClassifier = program.try_into().map_err(|error| {
+                source_failure("tc-ebpf", format!("invalid ingress program type: {error}"))
+            })?;
+            program.load().map_err(|error| {
+                source_failure(
+                    "tc-ebpf",
+                    format!("failed to load ingress program: {error}"),
+                )
+            })?;
+            program
+                .attach(&lan_interface, TcAttachType::Ingress)
+                .map_err(|error| {
+                    source_failure(
+                        "tc-ebpf",
+                        format!("failed to attach ingress program to {lan_interface}: {error}"),
+                    )
+                })?;
+        }
+
+        {
+            let program = ebpf
+                .program_mut("routescope_tc_egress")
+                .ok_or_else(|| source_failure("tc-ebpf", "egress program is missing"))?;
+            let program: &mut SchedClassifier = program.try_into().map_err(|error| {
+                source_failure("tc-ebpf", format!("invalid egress program type: {error}"))
+            })?;
+            program.load().map_err(|error| {
+                source_failure("tc-ebpf", format!("failed to load egress program: {error}"))
+            })?;
+            program
+                .attach(&lan_interface, TcAttachType::Egress)
+                .map_err(|error| {
+                    source_failure(
+                        "tc-ebpf",
+                        format!("failed to attach egress program to {lan_interface}: {error}"),
+                    )
+                })?;
+        }
+
+        Ok(Self {
+            ebpf: Mutex::new(ebpf),
+            lan_interface,
+            wan_interface,
+            session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
+    fn flow_from_entry(
+        &self,
+        key: EbpfFlowKey,
+        value: EbpfFlowValue,
+        now_ns: u64,
+        observed_at_ms: i64,
+    ) -> Flow {
+        let protocol = match key.protocol {
+            6 => "tcp",
+            17 => "udp",
+            _ => "unknown",
+        };
+        let direction = if key.direction == 0 {
+            FlowDirection::Upload
+        } else {
+            FlowDirection::Download
+        };
+        let client_ip = std::net::Ipv4Addr::from(u32::from_be(key.client_ip));
+        let destination_ip = std::net::Ipv4Addr::from(u32::from_be(key.destination_ip));
+        let first_seen = monotonic_timestamp_ms(now_ns, value.first_seen_ns, observed_at_ms);
+        let last_seen = monotonic_timestamp_ms(now_ns, value.last_seen_ns, observed_at_ms);
+
+        Flow {
+            flow_id: self.flow_id(&key, &value),
+            first_seen,
+            last_seen,
+            protocol: protocol.to_owned(),
+            direction,
+            lan_interface: self.lan_interface.clone(),
+            wan_interface: self.wan_interface.clone(),
+            client_mac: format_mac(key.client_mac),
+            client_ip: client_ip.to_string(),
+            client_port: u16::from_be(key.client_port),
+            destination_ip: destination_ip.to_string(),
+            destination_port: u16::from_be(key.destination_port),
+            nat_source_ip: None,
+            nat_source_port: None,
+            nat_destination_ip: None,
+            nat_destination_port: None,
+            upload_bytes: value.upload_bytes,
+            download_bytes: value.download_bytes,
+            packet_count: value.packet_count,
+            domain: None,
+            connection_state: ConnectionState::Established,
+        }
+    }
+
+    fn flow_id(&self, key: &EbpfFlowKey, value: &EbpfFlowValue) -> String {
+        format!(
+            "tc:v1:{}:{:x}:{}:{}:{}:{}:{}:{}:{}",
+            self.session_id,
+            value.first_seen_ns,
+            format_mac(key.client_mac),
+            key.direction,
+            key.protocol,
+            u32::from_be(key.client_ip),
+            u16::from_be(key.client_port),
+            u32::from_be(key.destination_ip),
+            u16::from_be(key.destination_port),
+        )
     }
 }
 
@@ -391,6 +631,42 @@ fn now_ms() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
+fn monotonic_ns() -> Result<u64, String> {
+    let mut timespec = MaybeUninit::<libc::timespec>::uninit();
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, timespec.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    let timespec = unsafe { timespec.assume_init() };
+    let seconds =
+        u64::try_from(timespec.tv_sec).map_err(|_| "monotonic seconds are negative".to_owned())?;
+    let nanoseconds = u64::try_from(timespec.tv_nsec)
+        .map_err(|_| "monotonic nanoseconds are negative".to_owned())?;
+
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .ok_or_else(|| "monotonic timestamp overflowed u64".to_owned())
+}
+
+fn monotonic_timestamp_ms(now_ns: u64, event_ns: u64, observed_at_ms: i64) -> i64 {
+    let age_ms = now_ns
+        .saturating_sub(event_ns)
+        .checked_div(1_000_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .unwrap_or(i64::MAX);
+
+    observed_at_ms.saturating_sub(age_ms)
+}
+
+fn format_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,8 +695,10 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_collector_is_unhealthy() {
-        let failure = TcEbpfCollector.collect().unwrap_err();
+    fn invalid_tc_ebpf_configuration_is_unhealthy() {
+        let failure = TcEbpfCollector::new("", "eth0")
+            .err()
+            .expect("empty LAN interface must be rejected");
 
         assert_eq!(failure.health.state, CollectorHealthState::Unhealthy);
 

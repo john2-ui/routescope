@@ -248,8 +248,9 @@ TC eBPF + conntrack + 用户态聚合
 
 ## 11. 当前项目文件结构
 
-当前代码已实现领域模型、SQLite 持久化、分钟聚合、只读 API、可选模拟采集
-以及 Linux namespace NAT 集成环境；真实 TC eBPF、conntrack/DNS 采集和认证仍在后续阶段。
+当前代码已实现领域模型、SQLite 持久化、分钟聚合、只读 API、可选模拟采集，
+以及第一版 TC eBPF IPv4 TCP/UDP 统计和 Linux namespace NAT 集成环境；
+conntrack/DNS 关联和认证仍在后续阶段。
 
 ```text
 .
@@ -268,6 +269,8 @@ TC eBPF + conntrack + 用户态聚合
 │   │   └── mod.rs              # 健康检查与受保护的只读 API 路由
 │   ├── auth.rs                 # 管理认证边界（TODO）
 │   ├── collector.rs            # 真实采集接口与模拟采集器
+│   ├── routescope_tc.c         # TC eBPF IPv4 TCP/UDP 统计程序
+│   ├── build.rs                # 编译 TC eBPF 对象文件
 │   ├── config.rs               # 监听地址和保留期配置
 │   ├── domain.rs               # Device、Flow、域名归因领域模型
 │   ├── service.rs              # 观测查询、Flow 写入与清理

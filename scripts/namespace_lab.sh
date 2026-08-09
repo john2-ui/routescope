@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 CLIENT_A_NS="routescope-client-a"
 CLIENT_B_NS="routescope-client-b"
 ROUTER_NS="routescope-router"
@@ -17,6 +19,9 @@ WAN_SERVER_IP="10.0.2.2"
 
 HTTP_SERVER_PID=""
 HTTP_SERVER_LOG=""
+ROUTESCOPE_PID=""
+ROUTESCOPE_LOG=""
+ROUTESCOPE_DB=""
 
 # Topology (namespaces + addressing):
 #
@@ -46,6 +51,7 @@ Usage:
   sudo scripts/namespace_lab.sh down
   sudo scripts/namespace_lab.sh status
   sudo scripts/namespace_lab.sh test
+  sudo scripts/namespace_lab.sh collector-test
 
 The test topology is:
   client-a/client-b -- br-lan -- router -- wan0 -- wan
@@ -198,6 +204,34 @@ show_status() {
     done
 }
 
+stop_wan_http_processes() {
+    if ! namespace_exists "$WAN_NS"; then
+        return 0
+    fi
+
+    ns_exec "$WAN_NS" pkill -TERM -f 'python3.*http.server 8080' 2>/dev/null || true
+    sleep 0.1
+    ns_exec "$WAN_NS" pkill -KILL -f 'python3.*http.server 8080' 2>/dev/null || true
+}
+
+stop_routescope_processes() {
+    if ! namespace_exists "$ROUTER_NS"; then
+        return 0
+    fi
+
+    ns_exec "$ROUTER_NS" pkill -TERM -f '/target/debug/routescope' 2>/dev/null || true
+    sleep 0.1
+    ns_exec "$ROUTER_NS" pkill -KILL -f '/target/debug/routescope' 2>/dev/null || true
+}
+
+reset_routescope_tc() {
+    if ! namespace_exists "$ROUTER_NS"; then
+        return 0
+    fi
+
+    ns_exec "$ROUTER_NS" tc qdisc del dev br-lan clsact 2>/dev/null || true
+}
+
 cleanup_http_server() {
     if [[ -n "$HTTP_SERVER_PID" ]]; then
         kill "$HTTP_SERVER_PID" 2>/dev/null || true
@@ -205,10 +239,157 @@ cleanup_http_server() {
         HTTP_SERVER_PID=""
     fi
 
+    stop_wan_http_processes
+
     if [[ -n "$HTTP_SERVER_LOG" ]]; then
         rm -f "$HTTP_SERVER_LOG"
         HTTP_SERVER_LOG=""
     fi
+}
+
+cleanup_routescope() {
+    if [[ -n "$ROUTESCOPE_PID" ]]; then
+        kill "$ROUTESCOPE_PID" 2>/dev/null || true
+        wait "$ROUTESCOPE_PID" 2>/dev/null || true
+        ROUTESCOPE_PID=""
+    fi
+
+    stop_routescope_processes
+    reset_routescope_tc
+
+    if [[ -n "$ROUTESCOPE_LOG" ]]; then
+        rm -f "$ROUTESCOPE_LOG"
+        ROUTESCOPE_LOG=""
+    fi
+
+    if [[ -n "$ROUTESCOPE_DB" ]]; then
+        rm -f "$ROUTESCOPE_DB"
+        ROUTESCOPE_DB=""
+    fi
+}
+
+start_routescope_collector() {
+    if [[ ! -x "$ROOT/target/debug/routescope" ]]; then
+        echo "error: build RouteScope first with 'cargo build'" >&2
+        return 1
+    fi
+
+    stop_routescope_processes
+    reset_routescope_tc
+
+    ROUTESCOPE_LOG="${TMPDIR:-/tmp}/routescope-collector.$$.log"
+    ROUTESCOPE_DB="${TMPDIR:-/tmp}/routescope-collector.$$.db"
+    : >"$ROUTESCOPE_LOG"
+    rm -f "$ROUTESCOPE_DB"
+
+    ns_exec "$ROUTER_NS" env \
+        ROUTESCOPE_LISTEN_ADDR=10.0.0.1:8080 \
+        ROUTESCOPE_DATABASE_PATH="$ROUTESCOPE_DB" \
+        ROUTESCOPE_DEV_BYPASS_AUTH=1 \
+        ROUTESCOPE_ENABLE_SIMULATOR=0 \
+        ROUTESCOPE_ENABLE_TC_EBPF=1 \
+        ROUTESCOPE_LAN_INTERFACE=br-lan \
+        ROUTESCOPE_WAN_INTERFACE=wan0 \
+        ROUTESCOPE_COLLECT_INTERVAL_SECS=1 \
+        "$ROOT/target/debug/routescope" \
+        >"$ROUTESCOPE_LOG" 2>&1 &
+    ROUTESCOPE_PID=$!
+
+    for _ in {1..50}; do
+        if ns_exec "$ROUTER_NS" curl \
+            --fail --silent --max-time 1 \
+            "http://${LAN_ROUTER_IP}:8080/healthz" >/dev/null; then
+            return 0
+        fi
+
+        if ! kill -0 "$ROUTESCOPE_PID" 2>/dev/null; then
+            echo "error: RouteScope exited before becoming ready. Log:" >&2
+            cat "$ROUTESCOPE_LOG" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+
+    echo "error: RouteScope did not become ready. Log:" >&2
+    cat "$ROUTESCOPE_LOG" >&2
+    return 1
+}
+
+assert_collector_devices() {
+    local devices_json=$1
+
+    printf '%s\n' "$devices_json" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+macs = {device["mac_address"] for device in data}
+expected = {"02:00:00:00:00:0a", "02:00:00:00:00:0b"}
+missing = expected - macs
+if missing:
+    raise SystemExit(f"missing devices: {sorted(missing)}; got {sorted(macs)}")
+print("ok: collector observed both namespace clients")
+'
+}
+
+assert_collector_flow() {
+    local mac_address=$1
+    local flows_json=$2
+
+    python3 -c '
+import json
+import sys
+
+mac = sys.argv[1]
+data = json.load(sys.stdin)
+if not data:
+    raise SystemExit(f"no flows for {mac}")
+if not any(flow["client_mac"] == mac and flow["packet_count"] > 0 for flow in data):
+    raise SystemExit(f"no packet-bearing flow for {mac}: {data}")
+print(f"ok: collector produced flows for {mac}")
+' "$mac_address" <<<"$flows_json"
+}
+
+test_collector_api() {
+    local devices_json=""
+    local laptop_flows=""
+    local phone_flows=""
+
+    for _ in {1..30}; do
+        devices_json=$(ns_exec "$ROUTER_NS" curl \
+            --fail --silent --max-time 1 \
+            "http://${LAN_ROUTER_IP}:8080/api/v1/devices") || true
+        if [[ -n "$devices_json" ]] && assert_collector_devices "$devices_json" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.2
+    done
+
+    if [[ -z "$devices_json" ]] || ! assert_collector_devices "$devices_json"; then
+        echo "error: collector did not observe namespace devices. Log:" >&2
+        cat "$ROUTESCOPE_LOG" >&2
+        return 1
+    fi
+
+    for _ in {1..30}; do
+        laptop_flows=$(ns_exec "$ROUTER_NS" curl \
+            --fail --silent --max-time 1 \
+            "http://${LAN_ROUTER_IP}:8080/api/v1/devices/${CLIENT_A_MAC}/flows") || true
+        phone_flows=$(ns_exec "$ROUTER_NS" curl \
+            --fail --silent --max-time 1 \
+            "http://${LAN_ROUTER_IP}:8080/api/v1/devices/${CLIENT_B_MAC}/flows") || true
+
+        if [[ -n "$laptop_flows" ]] \
+            && [[ -n "$phone_flows" ]] \
+            && assert_collector_flow "$CLIENT_A_MAC" "$laptop_flows" >/dev/null 2>&1 \
+            && assert_collector_flow "$CLIENT_B_MAC" "$phone_flows" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.2
+    done
+
+    assert_collector_flow "$CLIENT_A_MAC" "$laptop_flows"
+    assert_collector_flow "$CLIENT_B_MAC" "$phone_flows"
 }
 
 test_client_http() {
@@ -248,6 +429,10 @@ test_client_http() {
 
     if [[ "$nat_seen" -ne 1 ]]; then
         echo "error: WAN service did not observe the router WAN address for $client_name" >&2
+        echo "== WAN HTTP server log ==" >&2
+        cat "$HTTP_SERVER_LOG" >&2 || true
+        echo "== router nftables ruleset ==" >&2
+        ns_exec "$ROUTER_NS" nft list ruleset >&2 || true
         return 1
     fi
 
@@ -256,7 +441,7 @@ test_client_http() {
 
 test_topology() {
     require_root
-    require_commands ip curl python3 awk
+    require_commands ip curl python3 awk pkill
 
     for namespace in "$CLIENT_A_NS" "$CLIENT_B_NS" "$ROUTER_NS" "$WAN_NS"; do
         if ! namespace_exists "$namespace"; then
@@ -265,11 +450,13 @@ test_topology() {
         fi
     done
 
+    stop_wan_http_processes
+
     HTTP_SERVER_LOG="${TMPDIR:-/tmp}/routescope-wan-http.$$.log"
     : >"$HTTP_SERVER_LOG"
     trap cleanup_http_server EXIT
 
-    ns_exec "$WAN_NS" python3 -m http.server 8080 --bind "$WAN_SERVER_IP" \
+    ns_exec "$WAN_NS" python3 -u -m http.server 8080 --bind "$WAN_SERVER_IP" \
         >"$HTTP_SERVER_LOG" 2>&1 &
     HTTP_SERVER_PID=$!
 
@@ -277,6 +464,34 @@ test_topology() {
     test_client_http "$CLIENT_B_NS" "client-b"
 
     echo "namespace smoke test passed"
+}
+
+test_collector() {
+    require_root
+    require_commands ip curl python3 awk pkill tc
+
+    for namespace in "$CLIENT_A_NS" "$CLIENT_B_NS" "$ROUTER_NS" "$WAN_NS"; do
+        if ! namespace_exists "$namespace"; then
+            echo "error: namespace topology is not ready; run '$0 up' first" >&2
+            exit 1
+        fi
+    done
+
+    stop_wan_http_processes
+    trap 'cleanup_routescope; cleanup_http_server' EXIT
+    start_routescope_collector
+
+    HTTP_SERVER_LOG="${TMPDIR:-/tmp}/routescope-wan-http.$$.log"
+    : >"$HTTP_SERVER_LOG"
+    ns_exec "$WAN_NS" python3 -u -m http.server 8080 --bind "$WAN_SERVER_IP" \
+        >"$HTTP_SERVER_LOG" 2>&1 &
+    HTTP_SERVER_PID=$!
+
+    test_client_http "$CLIENT_A_NS" "client-a"
+    test_client_http "$CLIENT_B_NS" "client-b"
+    test_collector_api
+
+    echo "namespace TC eBPF collector test passed"
 }
 
 main() {
@@ -299,6 +514,9 @@ main() {
             ;;
         test)
             test_topology
+            ;;
+        collector-test)
+            test_collector
             ;;
         *)
             usage >&2

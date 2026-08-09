@@ -1,4 +1,4 @@
-.PHONY: run check test fmt seed smoke namespace-up namespace-down namespace-status namespace-test
+.PHONY: run check test fmt seed smoke namespace-up namespace-down namespace-status namespace-test namespace-collector-test
 
 run:
 	set -a && [ -f .env ] && . ./.env; set +a; cargo run
@@ -29,3 +29,7 @@ namespace-status:
 
 namespace-test:
 	scripts/namespace_lab.sh test
+
+namespace-collector-test:
+	cargo build
+	sudo scripts/namespace_lab.sh collector-test
