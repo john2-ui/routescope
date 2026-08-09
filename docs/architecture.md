@@ -54,23 +54,116 @@ eBPF 程序：C + libbpf + CO-RE
 
 ## 3. 生产拓扑
 
-```text
-上游网络 / 光猫
-        │
-     WAN 接口
-        │
-┌─────────────────────┐
-│ RouteScope 网关     │
-│                     │
-│ nftables / conntrack│
-│ TC eBPF             │
-│ DNS 代理            │
-│ 流量聚合服务         │
-└─────────────────────┘
-        │
-     LAN 接口
-        │
-  终端设备 / AP / 交换机
+```mermaid
+flowchart LR
+    UPSTREAM["上游网络 / 光猫<br/>互联网"]
+    WAN_IF["WAN 接口<br/>eth0"]
+    LAN_IF["LAN 接口<br/>br-lan"]
+    CLIENTS["终端设备 / AP / 交换机<br/>IPv4 LAN"]
+
+    UPSTREAM <--> WAN_IF
+    CLIENTS <--> LAN_IF
+
+    subgraph GATEWAY["RouteScope 网关"]
+        direction TB
+
+        subgraph DATAPLANE["Linux 数据面：双向转发与观测"]
+            direction TB
+
+            subgraph UPLOAD["上行路径：LAN → WAN"]
+                direction LR
+                LAN_IN["LAN ingress<br/>TC eBPF hook"]
+                U_META["提取 LAN 侧原始元数据<br/>client MAC/IP:port、目标 IP:port<br/>协议、报文长度、时间戳"]
+                U_ROUTE["Linux 路由与转发<br/>选择 WAN 出口"]
+                U_CT["conntrack 查找 / 创建<br/>记录 TCP/UDP 连接状态"]
+                U_FW["nftables forward<br/>按规则放行 / 丢弃"]
+                U_SNAT["nftables NAT<br/>SNAT：私网源地址 → 公网源地址"]
+                WAN_OUT["WAN egress<br/>TC eBPF hook"]
+                U_POST["提取 WAN 侧 NAT 后元数据<br/>translated tuple、出口接口"]
+
+                LAN_IN --> U_META --> U_ROUTE --> U_CT --> U_FW --> U_SNAT --> WAN_OUT --> U_POST
+            end
+
+            subgraph DOWNLOAD["下行路径：WAN → LAN"]
+                direction LR
+                WAN_IN["WAN ingress<br/>TC eBPF hook"]
+                D_META["提取 WAN 侧 NAT 后元数据<br/>公网五元组、入口接口、时间戳"]
+                D_CT["conntrack 反向查找<br/>恢复原始连接与 NAT 映射"]
+                D_DNAT["nftables NAT<br/>反向 DNAT：公网目标 → LAN 客户端"]
+                D_ROUTE["Linux 路由与转发<br/>选择 LAN 出口"]
+                D_FW["nftables forward<br/>按规则放行 / 丢弃"]
+                LAN_OUT["LAN egress<br/>TC eBPF hook"]
+                D_POST["提取 LAN 侧还原后元数据<br/>client MAC/IP:port、LAN 接口"]
+
+                WAN_IN --> D_META --> D_CT --> D_DNAT --> D_ROUTE --> D_FW --> LAN_OUT --> D_POST
+            end
+        end
+
+        subgraph DNS["DNS 域名归因链路"]
+            direction LR
+            DNS_MATCH["DNS 识别 / redirect<br/>nftables：UDP/TCP 53"]
+            DNS_PROXY["本地 DNS 代理<br/>按客户端接收与转发查询"]
+            DNS_UP["上游 DNS resolver"]
+            DNS_CACHE["短期关联缓存<br/>client IP/MAC → domain → target IP<br/>TTL、时间窗、source、confidence"]
+
+            DNS_MATCH --> DNS_PROXY
+            DNS_PROXY -->|查询| DNS_UP
+            DNS_UP -->|响应| DNS_PROXY
+            DNS_PROXY --> DNS_CACHE
+        end
+
+        subgraph OBSERVABILITY["用户态采集、归因与存储"]
+            direction TB
+            BPF_MAPS["TC eBPF maps<br/>per-flow / per-device counters<br/>按 CPU 聚合"]
+            EVENT_PIPE["观测数据读取<br/>周期性读取 map / 统计快照<br/>不保存原始网络包"]
+            CT_EXPORT["conntrack 查询<br/>NAT 前后映射、connection_state"]
+            COLLECTOR["Rust collector<br/>校验事件、补齐接口与方向"]
+            DEVICE_ID["设备身份解析<br/>MAC 为稳定主键<br/>DHCP / ARP / 手动名称"]
+            FLOW_AGG["Flow 聚合器<br/>五元组、方向、NAT 映射<br/>字节数、包数、首末时间"]
+            DOMAIN_JOIN["域名关联器<br/>按 client + target IP + TTL<br/>记录 domain_source / confidence"]
+            REALTIME["实时统计视图<br/>设备 / Flow / 域名 Top"]
+            SQLITE["SQLite 持久化<br/>Flow 连接明细：24h<br/>设备 / 域名分钟聚合：30d"]
+            API["只读 API / Web UI<br/>设备、Flow、域名 Top 查询"]
+
+            BPF_MAPS --> EVENT_PIPE --> COLLECTOR
+            CT_EXPORT --> COLLECTOR
+            COLLECTOR --> DEVICE_ID --> FLOW_AGG --> DOMAIN_JOIN
+            DOMAIN_JOIN --> REALTIME
+            DOMAIN_JOIN --> SQLITE
+            REALTIME --> API
+            SQLITE --> API
+        end
+    end
+
+    WAN_IF --> WAN_IN
+    WAN_OUT --> WAN_IF
+    LAN_IF --> LAN_IN
+    LAN_OUT --> LAN_IF
+
+    U_META -.->|采集| BPF_MAPS
+    U_POST -.->|采集| BPF_MAPS
+    D_META -.->|采集| BPF_MAPS
+    D_POST -.->|采集| BPF_MAPS
+    U_CT -.->|状态 / NAT| CT_EXPORT
+    D_CT -.->|状态 / NAT| CT_EXPORT
+
+    LAN_IN -.->|DNS 请求| DNS_MATCH
+    DNS_PROXY -.->|DNS 响应回 LAN| LAN_OUT
+    DNS_CACHE --> DOMAIN_JOIN
+    API -.->|管理面仅允许 LAN 访问| LAN_IF
+
+    classDef edge fill:#eaf2ff,stroke:#4472c4,color:#123;
+    classDef hook fill:#fff2cc,stroke:#bf9000,color:#000;
+    classDef process fill:#e2f0d9,stroke:#70ad47,color:#000;
+    classDef side fill:#f4f4f4,stroke:#777,color:#222;
+    classDef storage fill:#fce4d6,stroke:#c55a11,color:#000;
+
+    class UPSTREAM,WAN_IF,LAN_IF,CLIENTS edge;
+    class LAN_IN,WAN_IN,LAN_OUT,WAN_OUT hook;
+    class U_META,U_ROUTE,U_CT,U_FW,U_SNAT,U_POST,D_META,D_CT,D_DNAT,D_ROUTE,D_FW,D_POST process;
+    class BPF_MAPS,EVENT_PIPE,CT_EXPORT,COLLECTOR,DEVICE_ID,FLOW_AGG,DOMAIN_JOIN,REALTIME,API process;
+    class DNS_MATCH,DNS_PROXY,DNS_UP,DNS_CACHE side;
+    class SQLITE storage;
 ```
 
 软路由必须位于 LAN 与 WAN 之间，以确保客户端流量经过观测点。
