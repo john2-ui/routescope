@@ -12,6 +12,7 @@ pub struct Config {
 }
 
 impl Config {
+    /// 从环境变量加载运行配置；未设置项使用默认值。
     pub fn from_env() -> Self {
         let listen_addr = std::env::var("ROUTESCOPE_LISTEN_ADDR")
             .ok()

@@ -18,6 +18,27 @@ WAN_SERVER_IP="10.0.2.2"
 HTTP_SERVER_PID=""
 HTTP_SERVER_LOG=""
 
+# Topology (namespaces + addressing):
+#
+#   ┌─────────────────────┐         ┌──────────────────────────────────┐         ┌─────────────────────┐
+#   │ routescope-client-a │         │       routescope-router          │         │  routescope-wan     │
+#   │                     │  veth   │                                  │  veth   │                     │
+#   │ eth0                ├─────────┤ lan-a ──┐                        │         │                     │
+#   │ 10.0.0.10/24        │         │         │                        │         │ eth0                │
+#   │ MAC ..:0a           │         │      br-lan  10.0.0.1/24         │         │ 10.0.2.2/24         │
+#   └─────────────────────┘         │         │                        │         │ HTTP :8080 (test)   │
+#                                   │ lan-b ──┘                        │         └──────────▲──────────┘
+#   ┌─────────────────────┐         │                                  │                    │
+#   │ routescope-client-b │  veth   │ wan0  10.0.2.1/24  ──────────────┼────────────────────┘
+#   │                     ├─────────┤                                  │   10.0.2.0/24
+#   │ eth0                │         │ ip_forward=1                     │
+#   │ 10.0.0.11/24        │         │ nft: forward + MASQUERADE→wan0   │
+#   │ MAC ..:0b           │         └──────────────────────────────────┘
+#   └─────────────────────┘
+#
+#   LAN 10.0.0.0/24: clients default via 10.0.0.1
+#   WAN 10.0.2.0/24: wan default via 10.0.2.1; LAN egress SNAT to 10.0.2.1
+
 usage() {
     cat <<'EOF'
 Usage:

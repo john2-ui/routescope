@@ -23,6 +23,7 @@ use tokio::time::{self, MissedTickBehavior};
 
 const RETENTION_CLEANUP_INTERVAL_SECS: u64 = 60 * 60;
 
+/// 进程入口：加载配置、初始化存储与服务、启动后台任务并监听 HTTP。
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::from_env();
@@ -67,6 +68,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// 合并公开/受保护的 API 与 Web 路由，并注入共享状态。
 fn app(state: AppState) -> Router {
     Router::new()
         .merge(api::public_routes())
@@ -76,6 +78,7 @@ fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// 按固定间隔调用采集器，将 flow 写入观测服务，并打印健康/错误信息。
 async fn run_collection_loop(
     observation: Arc<ObservationService>,
     collector: Arc<dyn FlowCollector>,
@@ -87,16 +90,38 @@ async fn run_collection_loop(
     loop {
         ticker.tick().await;
 
-        let flows = collector.collect();
-        if let Err(error) = observation.ingest_flows(&flows) {
-            eprintln!(
-                "collector {} failed to ingest flows: {error}",
-                collector.source_name()
-            );
+        match collector.collect() {
+            Ok(batch) => {
+                if batch.health.state != collector::CollectorHealthState::Healthy {
+                    eprintln!(
+                        "collector {} health={:?} observed_at_ms={} error={:?}",
+                        collector.source_name(),
+                        batch.health.state,
+                        batch.observed_at_ms,
+                        batch.health.last_error
+                    );
+                }
+
+                if let Err(error) = observation.ingest_flows(&batch.flows) {
+                    eprintln!(
+                        "collector {} failed to ingest flows: {error}",
+                        collector.source_name()
+                    );
+                }
+            }
+            Err(failure) => {
+                eprintln!(
+                    "collector {} health={:?} failed: {}",
+                    collector.source_name(),
+                    failure.health.state,
+                    failure.error
+                );
+            }
         }
     }
 }
 
+/// 定期清理过期的 flow 与分钟聚合数据。
 async fn run_retention_cleanup_loop(observation: Arc<ObservationService>) {
     let mut ticker = time::interval(Duration::from_secs(RETENTION_CLEANUP_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -129,6 +154,7 @@ mod tests {
     use storage::RouteScopeRepository;
     use tower::ServiceExt;
 
+    /// 构造带内存库的测试用 Router。
     fn test_app(dev_bypass_auth: bool) -> Router {
         let repo = Arc::new(SqliteRepository::open_in_memory().unwrap());
         let observation = Arc::new(ObservationService::new(repo, 24, 30));

@@ -11,10 +11,12 @@ use crate::auth;
 use crate::domain::{Device, DeviceMinuteStat, DomainTrafficSummary, Flow};
 use crate::state::AppState;
 
+/// 注册公开 API 路由（健康检查）。
 pub fn public_routes() -> Router<AppState> {
     Router::new().route("/healthz", get(health_check))
 }
 
+/// 注册需鉴权的设备/流量/域名 JSON API。
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/api/v1/devices", get(list_devices))
@@ -25,10 +27,12 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route_layer(middleware::from_fn_with_state(state, auth::require_admin))
 }
 
+/// 健康检查，返回 `{"status":"ok"}`。
 async fn health_check() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// 返回全部设备列表。
 async fn list_devices(State(state): State<AppState>) -> Result<Json<Vec<Device>>, StatusCode> {
     state.observation.devices().map(Json).map_err(|err| {
         eprintln!("error listing failed: {err}");
@@ -36,6 +40,7 @@ async fn list_devices(State(state): State<AppState>) -> Result<Json<Vec<Device>>
     })
 }
 
+/// 按 MAC 返回单个设备；不存在时 404。
 async fn device_detail(
     State(state): State<AppState>,
     Path(mac_address): Path<String>,
@@ -50,6 +55,7 @@ async fn device_detail(
     }
 }
 
+/// 返回某设备的分钟流量序列。
 async fn device_traffic(
     State(state): State<AppState>,
     Path(mac_address): Path<String>,
@@ -65,6 +71,7 @@ async fn device_traffic(
         })
 }
 
+/// 返回某设备的近期 flow/连接列表。
 async fn device_flows(
     State(state): State<AppState>,
     Path(mac_address): Path<String>,
@@ -80,6 +87,7 @@ async fn device_flows(
         })
 }
 
+/// 返回某设备的域名流量 Top。
 async fn device_domains(
     State(state): State<AppState>,
     Path(mac_address): Path<String>,
@@ -95,6 +103,7 @@ async fn device_domains(
         })
 }
 
+/// 确认设备存在；不存在返回 404，查询失败返回 500。
 fn require_device(state: &AppState, mac_address: &str) -> Result<(), StatusCode> {
     match state.observation.device(mac_address) {
         Ok(Some(_)) => Ok(()),

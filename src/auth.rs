@@ -13,6 +13,7 @@ use axum::{
 
 use crate::state::AppState;
 
+/// 管理路由鉴权中间件：开发绕过开启则放行，否则返回 503（鉴权尚未实现）。
 pub async fn require_admin(
     State(state): State<AppState>,
     request: Request<Body>,

@@ -2,28 +2,37 @@
 
 use crate::domain::{
     ConnectionState, Device, DeviceMinuteStat, DomainAttribution, DomainConfidence, DomainSource,
-    DomainTrafficSummary, Flow, FlowDirection, floor_to_minute_ms,
+    DomainTrafficSummary, Flow, FlowCounters, FlowDirection, floor_to_minute_ms,
 };
 use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, Transaction, params};
 use std::sync::Mutex;
 
+/// RouteScope 持久化仓储接口。
 pub trait RouteScopeRepository: Send + Sync {
+    /// 按 MAC 插入或更新设备。
     fn upsert_device(&self, device: &Device) -> SqliteResult<()>;
+    /// 写入/更新 flow，并按计数增量更新分钟聚合。
     fn upsert_flow(&self, flow: &Flow) -> SqliteResult<()>;
+    /// 列出全部设备。
     fn list_devices(&self) -> SqliteResult<Vec<Device>>;
+    /// 按 MAC 查询单个设备。
     fn find_device(&self, mac_address: &str) -> SqliteResult<Option<Device>>;
+    /// 查询某设备全部 flow（按 last_seen 降序）。
     fn list_recent_flows(&self, mac_address: &str) -> SqliteResult<Vec<Flow>>;
+    /// 查询某设备自 `since_ms` 起的分钟流量序列。
     fn list_device_minute_stats(
         &self,
         mac_address: &str,
         since_ms: i64,
     ) -> SqliteResult<Vec<DeviceMinuteStat>>;
+    /// 聚合某设备域名流量 Top N。
     fn list_domain_traffic_top(
         &self,
         mac_address: &str,
         since_ms: i64,
         limit: usize,
     ) -> SqliteResult<Vec<DomainTrafficSummary>>;
+    /// 按保留窗口删除过期 flow 与分钟聚合，返回删除行数。
     fn delete_expired_data(
         &self,
         now_ms: i64,
@@ -37,6 +46,7 @@ pub struct SqliteRepository {
 }
 
 impl SqliteRepository {
+    /// 打开文件数据库并执行 schema 迁移。
     pub fn open(path: &str) -> SqliteResult<Self> {
         let conn = Connection::open(path)?;
         let repo = Self {
@@ -46,6 +56,7 @@ impl SqliteRepository {
         Ok(repo)
     }
 
+    /// 打开内存数据库（仅测试使用）。
     #[cfg(test)]
     pub fn open_in_memory() -> SqliteResult<Self> {
         let conn = Connection::open_in_memory()?;
@@ -56,6 +67,7 @@ impl SqliteRepository {
         Ok(repo)
     }
 
+    /// 创建 devices / flows / 分钟聚合表及索引。
     fn migrate(&self) -> SqliteResult<()> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         conn.execute_batch(
@@ -126,6 +138,7 @@ impl SqliteRepository {
     }
 }
 
+/// 向设备分钟表累加上下行字节。
 fn add_device_minute_bytes(
     tx: &Transaction<'_>,
     mac_address: &str,
@@ -133,6 +146,9 @@ fn add_device_minute_bytes(
     upload_bytes: u64,
     download_bytes: u64,
 ) -> SqliteResult<()> {
+    let upload_bytes = counter_to_sqlite_integer(upload_bytes, "upload_bytes")?;
+    let download_bytes = counter_to_sqlite_integer(download_bytes, "download_bytes")?;
+
     tx.execute(
         r#"
         INSERT INTO device_minute_stats
@@ -142,16 +158,12 @@ fn add_device_minute_bytes(
             upload_bytes = upload_bytes + excluded.upload_bytes,
             download_bytes = download_bytes + excluded.download_bytes
         "#,
-        params![
-            mac_address,
-            minute_ms,
-            upload_bytes as i64,
-            download_bytes as i64
-        ],
+        params![mac_address, minute_ms, upload_bytes, download_bytes],
     )?;
     Ok(())
 }
 
+/// 向域名分钟表累加字节，并更新 source/confidence。
 fn add_domain_minute_bytes(
     tx: &Transaction<'_>,
     mac_address: &str,
@@ -160,6 +172,9 @@ fn add_domain_minute_bytes(
     upload_bytes: u64,
     download_bytes: u64,
 ) -> SqliteResult<()> {
+    let upload_bytes = counter_to_sqlite_integer(upload_bytes, "upload_bytes")?;
+    let download_bytes = counter_to_sqlite_integer(download_bytes, "download_bytes")?;
+
     tx.execute(
         r#"
         INSERT INTO domain_minute_stats
@@ -176,8 +191,8 @@ fn add_domain_minute_bytes(
             mac_address,
             attribution.domain,
             minute_ms,
-            upload_bytes as i64,
-            download_bytes as i64,
+            upload_bytes,
+            download_bytes,
             attribution.source.as_str(),
             attribution.confidence.as_str(),
         ],
@@ -185,7 +200,28 @@ fn add_domain_minute_bytes(
     Ok(())
 }
 
+/// 构造计数非法相关的 rusqlite 错误。
+fn invalid_counter_error(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    )))
+}
+
+/// 将 `u64` 计数转为 SQLite INTEGER；越界则报错。
+fn counter_to_sqlite_integer(value: u64, field: &str) -> SqliteResult<i64> {
+    i64::try_from(value)
+        .map_err(|_| invalid_counter_error(format!("{field} exceeds SQLite INTEGER range")))
+}
+
+/// 将 SQLite INTEGER 读回 `u64`；负值则报错。
+fn counter_from_sqlite_integer(value: i64, field: &str) -> SqliteResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| invalid_counter_error(format!("stored {field} must not be negative")))
+}
+
 impl RouteScopeRepository for SqliteRepository {
+    /// 按 MAC 插入或更新设备；保留已有 display_name，更新 current_ip。
     fn upsert_device(&self, device: &Device) -> SqliteResult<()> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         conn.execute(
@@ -202,9 +238,18 @@ impl RouteScopeRepository for SqliteRepository {
         Ok(())
     }
 
+    /// 校验并 upsert flow；按计数增量更新设备/域名分钟聚合。
     fn upsert_flow(&self, flow: &Flow) -> SqliteResult<()> {
         flow.validate()
             .map_err(|msg| rusqlite::Error::ToSqlConversionFailure(msg.into()))?;
+
+        let current_counters = FlowCounters::from_flow(flow);
+        let current_upload_bytes =
+            counter_to_sqlite_integer(current_counters.upload_bytes, "upload_bytes")?;
+        let current_download_bytes =
+            counter_to_sqlite_integer(current_counters.download_bytes, "download_bytes")?;
+        let current_packet_count =
+            counter_to_sqlite_integer(current_counters.packet_count, "packet_count")?;
 
         self.upsert_device(&Device {
             mac_address: flow.client_mac.clone(),
@@ -227,20 +272,26 @@ impl RouteScopeRepository for SqliteRepository {
         let mut conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let tx = conn.transaction()?;
 
-        let previous: Option<(u64, u64)> = tx
+        let previous: Option<FlowCounters> = tx
             .query_row(
-                "SELECT upload_bytes, download_bytes FROM flows WHERE flow_id = ?1",
+                "SELECT upload_bytes, download_bytes, packet_count
+                 FROM flows WHERE flow_id = ?1",
                 params![flow.flow_id],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+                |row| {
+                    Ok(FlowCounters {
+                        upload_bytes: counter_from_sqlite_integer(row.get(0)?, "upload_bytes")?,
+                        download_bytes: counter_from_sqlite_integer(row.get(1)?, "download_bytes")?,
+                        packet_count: counter_from_sqlite_integer(row.get(2)?, "packet_count")?,
+                    })
+                },
             )
             .optional()?;
 
-        let (delta_upload, delta_download) = match previous {
-            Some((prev_up, prev_down)) => (
-                flow.upload_bytes.saturating_sub(prev_up),
-                flow.download_bytes.saturating_sub(prev_down),
-            ),
-            None => (flow.upload_bytes, flow.download_bytes),
+        let delta = match previous {
+            Some(previous) => current_counters.delta_from(previous).map_err(|reset| {
+                invalid_counter_error(format!("flow {}: {reset}", flow.flow_id))
+            })?,
+            None => current_counters,
         };
 
         tx.execute(
@@ -297,9 +348,9 @@ impl RouteScopeRepository for SqliteRepository {
                 flow.nat_source_port.map(|v| v as i64),
                 flow.nat_destination_ip,
                 flow.nat_destination_port.map(|v| v as i64),
-                flow.upload_bytes as i64,
-                flow.download_bytes as i64,
-                flow.packet_count as i64,
+                current_upload_bytes,
+                current_download_bytes,
+                current_packet_count,
                 domain,
                 domain_source,
                 domain_confidence,
@@ -309,14 +360,14 @@ impl RouteScopeRepository for SqliteRepository {
             ],
         )?;
 
-        if delta_upload > 0 || delta_download > 0 {
+        if delta.upload_bytes > 0 || delta.download_bytes > 0 {
             let minute_ms = floor_to_minute_ms(flow.last_seen);
             add_device_minute_bytes(
                 &tx,
                 &flow.client_mac,
                 minute_ms,
-                delta_upload,
-                delta_download,
+                delta.upload_bytes,
+                delta.download_bytes,
             )?;
             if let Some(attribution) = &flow.domain {
                 add_domain_minute_bytes(
@@ -324,8 +375,8 @@ impl RouteScopeRepository for SqliteRepository {
                     &flow.client_mac,
                     attribution,
                     minute_ms,
-                    delta_upload,
-                    delta_download,
+                    delta.upload_bytes,
+                    delta.download_bytes,
                 )?;
             }
         }
@@ -334,6 +385,7 @@ impl RouteScopeRepository for SqliteRepository {
         Ok(())
     }
 
+    /// 列出全部设备（按 MAC 排序）。
     fn list_devices(&self) -> SqliteResult<Vec<Device>> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let mut stmt = conn.prepare(
@@ -353,6 +405,7 @@ impl RouteScopeRepository for SqliteRepository {
         rows.collect()
     }
 
+    /// 按 MAC 查询单个设备。
     fn find_device(&self, mac_address: &str) -> SqliteResult<Option<Device>> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         conn.query_row(
@@ -373,6 +426,7 @@ impl RouteScopeRepository for SqliteRepository {
         .optional()
     }
 
+    /// 查询某设备全部 flow（含域名归因），按 last_seen 降序。
     fn list_recent_flows(&self, mac_address: &str) -> SqliteResult<Vec<Flow>> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let mut stmt = conn.prepare(
@@ -440,6 +494,7 @@ impl RouteScopeRepository for SqliteRepository {
         rows.collect()
     }
 
+    /// 查询某设备自 `since_ms` 起的分钟流量序列。
     fn list_device_minute_stats(
         &self,
         mac_address: &str,
@@ -465,6 +520,7 @@ impl RouteScopeRepository for SqliteRepository {
         rows.collect()
     }
 
+    /// 聚合某设备域名流量 Top N（按总字节排序，附带置信度与来源）。
     fn list_domain_traffic_top(
         &self,
         mac_address: &str,
@@ -530,6 +586,7 @@ impl RouteScopeRepository for SqliteRepository {
         rows.collect()
     }
 
+    /// 按保留窗口删除过期 flow 与分钟聚合，返回 `(删除 flow 数, 删除聚合行数)`。
     fn delete_expired_data(
         &self,
         now_ms: i64,
@@ -752,6 +809,45 @@ mod tests {
         assert_eq!(domains[0].total_bytes, 4_000);
         assert_eq!(domains[0].confidence, DomainConfidence::High);
         assert_eq!(domains[0].source, DomainSource::Dns);
+    }
+
+    #[test]
+    fn duplicate_flow_snapshot_is_idempotent() {
+        let repo = SqliteRepository::open_in_memory().unwrap();
+        let mac = "aa:bb:cc:dd:ee:ff";
+        let flow = sample_flow("flow-duplicate", mac, 125_000);
+
+        repo.upsert_flow(&flow).unwrap();
+        repo.upsert_flow(&flow).unwrap();
+
+        let stats = repo.list_device_minute_stats(mac, 0).unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].upload_bytes, flow.upload_bytes);
+        assert_eq!(stats[0].download_bytes, flow.download_bytes);
+    }
+
+    #[test]
+    fn counter_reset_is_rejected_without_overwriting_existing_snapshot() {
+        let repo = SqliteRepository::open_in_memory().unwrap();
+        let mac = "aa:bb:cc:dd:ee:ff";
+        let mut flow = sample_flow("flow-reset", mac, 125_000);
+        flow.upload_bytes = 1_000;
+        flow.download_bytes = 2_000;
+        flow.packet_count = 30;
+
+        repo.upsert_flow(&flow).unwrap();
+
+        flow.upload_bytes = 900;
+        flow.download_bytes = 2_100;
+        flow.packet_count = 31;
+
+        assert!(repo.upsert_flow(&flow).is_err());
+
+        let stored = repo.list_recent_flows(mac).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].upload_bytes, 1_000);
+        assert_eq!(stored[0].download_bytes, 2_000);
+        assert_eq!(stored[0].packet_count, 30);
     }
 
     #[test]

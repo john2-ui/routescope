@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::{error::Error, fmt};
 
 pub type TimestampMs = i64;
 
-/// Floor a timestamp to the start of its UTC minute bucket.
+/// 将时间戳向下取整到其所在 UTC 分钟桶的起点。
 pub fn floor_to_minute_ms(ts: TimestampMs) -> TimestampMs {
     ts - ts.rem_euclid(60_000)
 }
@@ -48,6 +49,7 @@ pub struct Flow {
 }
 
 impl Flow {
+    /// 校验 flow 必填字段与时间顺序是否合法。
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.flow_id.is_empty() {
             return Err("flow_id must not be empty");
@@ -74,6 +76,62 @@ impl Flow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlowCounters {
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub packet_count: u64,
+}
+
+impl FlowCounters {
+    /// 从 Flow 提取累计计数器快照。
+    pub fn from_flow(flow: &Flow) -> Self {
+        Self {
+            upload_bytes: flow.upload_bytes,
+            download_bytes: flow.download_bytes,
+            packet_count: flow.packet_count,
+        }
+    }
+
+    /// 计算相对上次快照的增量；任一计数回退则返回 `CounterReset`。
+    pub fn delta_from(self, previous: Self) -> Result<Self, CounterReset> {
+        if self.upload_bytes < previous.upload_bytes
+            || self.download_bytes < previous.download_bytes
+            || self.packet_count < previous.packet_count
+        {
+            return Err(CounterReset {
+                previous,
+                current: self,
+            });
+        }
+
+        Ok(Self {
+            upload_bytes: self.upload_bytes - previous.upload_bytes,
+            download_bytes: self.download_bytes - previous.download_bytes,
+            packet_count: self.packet_count - previous.packet_count,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterReset {
+    pub previous: FlowCounters,
+    pub current: FlowCounters,
+}
+
+impl fmt::Display for CounterReset {
+    /// 格式化计数回退错误信息。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "flow counter decreased: previous={:?}, current={:?}",
+            self.previous, self.current
+        )
+    }
+}
+
+impl Error for CounterReset {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowDirection {
     Upload,
@@ -81,6 +139,7 @@ pub enum FlowDirection {
 }
 
 impl FlowDirection {
+    /// 转为持久化/序列化用的字符串。
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Upload => "upload",
@@ -88,6 +147,7 @@ impl FlowDirection {
         }
     }
 
+    /// 从字符串解析流量方向。
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "upload" => Some(Self::Upload),
@@ -108,6 +168,7 @@ pub enum ConnectionState {
 }
 
 impl ConnectionState {
+    /// 转为持久化/序列化用的字符串。
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::New => "new",
@@ -118,6 +179,7 @@ impl ConnectionState {
         }
     }
 
+    /// 从字符串解析连接状态。
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "new" => Some(Self::New),
@@ -148,6 +210,7 @@ pub enum DomainSource {
 }
 
 impl DomainSource {
+    /// 转为持久化/序列化用的字符串。
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Dns => "dns",
@@ -155,6 +218,8 @@ impl DomainSource {
             Self::Unknown => "unknown",
         }
     }
+
+    /// 从字符串解析域名归因来源。
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "dns" => Some(Self::Dns),
@@ -174,6 +239,7 @@ pub enum DomainConfidence {
 }
 
 impl DomainConfidence {
+    /// 转为持久化/序列化用的字符串。
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::High => "high",
@@ -181,6 +247,8 @@ impl DomainConfidence {
             Self::Unknown => "unknown",
         }
     }
+
+    /// 从字符串解析域名归因置信度。
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "high" => Some(Self::High),

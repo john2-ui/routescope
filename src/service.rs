@@ -15,6 +15,7 @@ pub struct ObservationService {
 }
 
 impl ObservationService {
+    /// 注入仓储与数据保留策略，创建观测服务。
     pub fn new(
         repo: Arc<SqliteRepository>,
         flow_retention_hours: u32,
@@ -27,14 +28,17 @@ impl ObservationService {
         }
     }
 
+    /// 列出全部设备。
     pub fn devices(&self) -> Result<Vec<Device>, rusqlite::Error> {
         self.repo.list_devices()
     }
 
+    /// 按 MAC 查询单个设备。
     pub fn device(&self, mac_address: &str) -> Result<Option<Device>, rusqlite::Error> {
         self.repo.find_device(mac_address)
     }
 
+    /// 查询某设备近期 flow，并按 flow 保留窗口再过滤。
     pub fn recent_flows(&self, mac_address: &str) -> Result<Vec<Flow>, rusqlite::Error> {
         let flows = self.repo.list_recent_flows(mac_address)?;
         let cutoff = now_ms() - i64::from(self.flow_retention_hours) * 3_600_000;
@@ -44,6 +48,7 @@ impl ObservationService {
             .collect())
     }
 
+    /// 查询某设备在聚合保留窗口内的分钟流量序列。
     pub fn device_traffic(
         &self,
         mac_address: &str,
@@ -52,6 +57,7 @@ impl ObservationService {
         self.repo.list_device_minute_stats(mac_address, cutoff)
     }
 
+    /// 查询某设备域名流量 Top（使用 flow 保留窗口，与近期连接视图对齐）。
     pub fn device_domain_top(
         &self,
         mac_address: &str,
@@ -62,6 +68,7 @@ impl ObservationService {
             .list_domain_traffic_top(mac_address, cutoff, DEFAULT_DOMAIN_TOP_LIMIT)
     }
 
+    /// 批量写入 flow，返回成功写入条数。
     pub fn ingest_flows(&self, flows: &[Flow]) -> Result<usize, rusqlite::Error> {
         for flow in flows {
             self.repo.upsert_flow(flow)?;
@@ -70,6 +77,7 @@ impl ObservationService {
         Ok(flows.len())
     }
 
+    /// 按当前时间与保留策略清理过期 flow 与聚合数据。
     pub fn cleanup_expired_data(&self) -> Result<(usize, usize), rusqlite::Error> {
         self.repo.delete_expired_data(
             now_ms(),
@@ -79,6 +87,7 @@ impl ObservationService {
     }
 }
 
+/// 返回当前 Unix 毫秒时间戳。
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
