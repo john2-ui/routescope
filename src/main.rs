@@ -1,6 +1,5 @@
 mod api;
 mod auth;
-#[allow(dead_code)]
 mod collector;
 mod config;
 mod domain;
@@ -10,23 +9,28 @@ mod storage;
 mod web;
 
 use axum::Router;
+use collector::{FlowCollector, SimulatedCollector};
 use config::Config;
 use service::ObservationService;
 use state::AppState;
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use storage::SqliteRepository;
 use tokio::net::TcpListener;
+use tokio::time::{self, MissedTickBehavior};
+
+const RETENTION_CLEANUP_INTERVAL_SECS: u64 = 60 * 60;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::from_env();
 
-    if let Some(parent) = Path::new(&config.database_path).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = Path::new(&config.database_path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let repo = Arc::new(SqliteRepository::open(&config.database_path)?);
@@ -35,6 +39,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.flow_retention_hours,
         config.aggregate_retention_days,
     ));
+
+    let _retention_task = tokio::spawn(run_retention_cleanup_loop(Arc::clone(&observation)));
+
+    let _simulator_task = if config.simulator_enabled {
+        let collector: Arc<dyn FlowCollector> = Arc::new(SimulatedCollector::with_interval_secs(
+            config.simulator_interval_secs,
+        ));
+
+        Some(tokio::spawn(run_collection_loop(
+            Arc::clone(&observation),
+            collector,
+            config.simulator_interval_secs,
+        )))
+    } else {
+        None
+    };
+
     let state = AppState {
         observation,
         dev_bypass_auth: config.dev_bypass_auth,
@@ -53,6 +74,49 @@ fn app(state: AppState) -> Router {
         .merge(web::public_routes())
         .merge(web::protected_routes(state.clone()))
         .with_state(state)
+}
+
+async fn run_collection_loop(
+    observation: Arc<ObservationService>,
+    collector: Arc<dyn FlowCollector>,
+    interval_secs: u64,
+) {
+    let mut ticker = time::interval(Duration::from_secs(interval_secs.max(1)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+
+        let flows = collector.collect();
+        if let Err(error) = observation.ingest_flows(&flows) {
+            eprintln!(
+                "collector {} failed to ingest flows: {error}",
+                collector.source_name()
+            );
+        }
+    }
+}
+
+async fn run_retention_cleanup_loop(observation: Arc<ObservationService>) {
+    let mut ticker = time::interval(Duration::from_secs(RETENTION_CLEANUP_INTERVAL_SECS));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+
+        match observation.cleanup_expired_data() {
+            Ok((deleted_flows, deleted_aggregates))
+                if deleted_flows > 0 || deleted_aggregates > 0 =>
+            {
+                eprintln!(
+                    "retention cleanup removed {deleted_flows} flows and \
+                     {deleted_aggregates} aggregate rows"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("retention cleanup failed: {error}"),
+        }
+    }
 }
 
 #[cfg(test)]

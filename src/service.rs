@@ -61,6 +61,22 @@ impl ObservationService {
         self.repo
             .list_domain_traffic_top(mac_address, cutoff, DEFAULT_DOMAIN_TOP_LIMIT)
     }
+
+    pub fn ingest_flows(&self, flows: &[Flow]) -> Result<usize, rusqlite::Error> {
+        for flow in flows {
+            self.repo.upsert_flow(flow)?;
+        }
+
+        Ok(flows.len())
+    }
+
+    pub fn cleanup_expired_data(&self) -> Result<(usize, usize), rusqlite::Error> {
+        self.repo.delete_expired_data(
+            now_ms(),
+            self.flow_retention_hours,
+            self.aggregate_retention_days,
+        )
+    }
 }
 
 fn now_ms() -> i64 {

@@ -7,6 +7,8 @@ pub struct Config {
     pub flow_retention_hours: u32,
     pub aggregate_retention_days: u32,
     pub dev_bypass_auth: bool,
+    pub simulator_enabled: bool,
+    pub simulator_interval_secs: u64,
 }
 
 impl Config {
@@ -25,6 +27,14 @@ impl Config {
             dev_bypass_auth: std::env::var("ROUTESCOPE_DEV_BYPASS_AUTH")
                 .map(|value| value == "1")
                 .unwrap_or(false),
+            simulator_enabled: std::env::var("ROUTESCOPE_ENABLE_SIMULATOR")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            simulator_interval_secs: std::env::var("ROUTESCOPE_SIMULATOR_INTERVAL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(5),
         }
     }
 }

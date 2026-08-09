@@ -46,6 +46,7 @@ impl SqliteRepository {
         Ok(repo)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> SqliteResult<Self> {
         let conn = Connection::open_in_memory()?;
         let repo = Self {
@@ -192,7 +193,7 @@ impl RouteScopeRepository for SqliteRepository {
         INSERT INTO devices (mac_address, display_name, current_ip, updated_at_ms)
         VALUES (?1, ?2, ?3, strftime('%s','now') * 1000)
         ON CONFLICT(mac_address) DO UPDATE SET
-            display_name = excluded.display_name,
+            display_name = COALESCE(excluded.display_name, devices.display_name),
             current_ip   = excluded.current_ip,
             updated_at_ms = excluded.updated_at_ms
         "#,
@@ -634,6 +635,26 @@ mod tests {
     }
 
     #[test]
+    fn flow_ingestion_preserves_manual_device_name() {
+        let repo = SqliteRepository::open_in_memory().unwrap();
+        let mac = "aa:bb:cc:dd:ee:ff";
+
+        repo.upsert_device(&Device {
+            mac_address: mac.to_string(),
+            display_name: Some("Living Room TV".to_string()),
+            current_ip: Some("192.168.1.20".to_string()),
+        })
+        .unwrap();
+
+        repo.upsert_flow(&sample_flow("flow-1", mac, 10_000))
+            .unwrap();
+
+        let device = repo.find_device(mac).unwrap().unwrap();
+        assert_eq!(device.display_name.as_deref(), Some("Living Room TV"));
+        assert_eq!(device.current_ip.as_deref(), Some("192.168.1.10"));
+    }
+
+    #[test]
     fn upsert_flow_round_trips_with_domain_attribution() {
         let repo = SqliteRepository::open_in_memory().unwrap();
         let flow = sample_flow("flow-1", "aa:bb:cc:dd:ee:ff", 10_000);
@@ -653,7 +674,7 @@ mod tests {
 
         repo.upsert_flow(&sample_flow("old", mac, now - 25 * 3_600_000))
             .unwrap();
-        repo.upsert_flow(&sample_flow("new", mac, now - 1 * 3_600_000))
+        repo.upsert_flow(&sample_flow("new", mac, now - 3_600_000))
             .unwrap();
 
         let (deleted_flows, _) = repo.delete_expired_data(now, 24, 30).unwrap();
@@ -669,7 +690,7 @@ mod tests {
         let repo = SqliteRepository::open_in_memory().unwrap();
         let now = 100_000_000i64;
         let old_minute = now - 31 * 86_400_000;
-        let new_minute = now - 1 * 86_400_000;
+        let new_minute = now - 86_400_000;
 
         {
             let conn = repo.conn.lock().unwrap();
