@@ -121,6 +121,14 @@ def upsert_flow(conn: sqlite3.Connection, row: dict) -> None:
             upload_bytes = excluded.upload_bytes,
             download_bytes = excluded.download_bytes,
             packet_count = excluded.packet_count,
+            nat_source_ip = COALESCE(excluded.nat_source_ip, flows.nat_source_ip),
+            nat_source_port = COALESCE(excluded.nat_source_port, flows.nat_source_port),
+            nat_destination_ip = COALESCE(
+                excluded.nat_destination_ip, flows.nat_destination_ip
+            ),
+            nat_destination_port = COALESCE(
+                excluded.nat_destination_port, flows.nat_destination_port
+            ),
             domain = excluded.domain,
             domain_source = excluded.domain_source,
             domain_confidence = excluded.domain_confidence,
@@ -197,7 +205,7 @@ def seed(db_path: Path) -> None:
                 "first_seen": ts - 60_000,
                 "last_seen": ts - 5_000,
                 "protocol": "tcp",
-                "direction": "upload",
+                "direction": "bidirectional",
                 "lan_interface": "br-lan",
                 "wan_interface": "eth0",
                 "client_mac": "aa:bb:cc:dd:ee:01",
@@ -227,7 +235,7 @@ def seed(db_path: Path) -> None:
                 "first_seen": ts - 90_000,
                 "last_seen": ts - 70_000,
                 "protocol": "tcp",
-                "direction": "download",
+                "direction": "bidirectional",
                 "lan_interface": "br-lan",
                 "wan_interface": "eth0",
                 "client_mac": "aa:bb:cc:dd:ee:01",
@@ -257,7 +265,7 @@ def seed(db_path: Path) -> None:
                 "first_seen": ts - 120_000,
                 "last_seen": ts - 10_000,
                 "protocol": "udp",
-                "direction": "download",
+                "direction": "bidirectional",
                 "lan_interface": "br-lan",
                 "wan_interface": "eth0",
                 "client_mac": "aa:bb:cc:dd:ee:02",

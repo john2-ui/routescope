@@ -1,10 +1,14 @@
 //! Kernel and network data-source boundaries.
 //!
-//! TODO: Implement the collectors with TC eBPF, conntrack events, and the local DNS proxy.
+//! The TC eBPF collector and conntrack enrichment live here; the local DNS
+//! proxy remains a future data source.
 
-use crate::domain::{
-    ConnectionState, CounterReset, DomainAttribution, DomainConfidence, DomainSource, Flow,
-    FlowDirection,
+use crate::{
+    conntrack::{Association, ConntrackReader},
+    domain::{
+        ConnectionState, CounterReset, DomainAttribution, DomainConfidence, DomainSource, Flow,
+        FlowDirection,
+    },
 };
 use aya::{
     Ebpf,
@@ -18,7 +22,7 @@ use core::fmt;
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
 use std::sync::{
-    Mutex,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -163,8 +167,8 @@ pub type CollectionResult = Result<CollectionBatch, CollectorFailure>;
 #[derive(Debug, Clone, Copy)]
 struct EbpfFlowKey {
     client_mac: [u8; 6],
-    direction: u8,
     protocol: u8,
+    _padding: u8,
     client_ip: u32,
     destination_ip: u32,
     client_port: u16,
@@ -192,6 +196,52 @@ pub trait FlowCollector: Send + Sync {
 
     /// 执行一次采集，返回 flow 批次或失败信息。
     fn collect(&self) -> CollectionResult;
+}
+
+/// 将基础 Flow 快照与 conntrack 只读快照合并。
+pub struct ConntrackEnrichedCollector {
+    base: Arc<dyn FlowCollector>,
+    conntrack: Arc<dyn ConntrackReader>,
+}
+
+impl ConntrackEnrichedCollector {
+    pub fn new(base: Arc<dyn FlowCollector>, conntrack: Arc<dyn ConntrackReader>) -> Self {
+        Self { base, conntrack }
+    }
+}
+
+impl FlowCollector for ConntrackEnrichedCollector {
+    fn source_name(&self) -> &'static str {
+        "tc-ebpf+conntrack"
+    }
+
+    fn collect(&self) -> CollectionResult {
+        let mut batch = self.base.collect()?;
+
+        let snapshot = match self.conntrack.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                batch.health.state = CollectorHealthState::Degraded;
+                batch.health.last_error = Some(error);
+                batch.health.flows_emitted = batch.flows.len();
+                return Ok(batch);
+            }
+        };
+
+        for flow in &mut batch.flows {
+            if let Association::Matched(entry) = snapshot.associate(flow) {
+                if let Some(mapping) = entry.nat_mapping() {
+                    flow.nat_source_ip = Some(mapping.source_ip.to_string());
+                    flow.nat_source_port = Some(mapping.source_port);
+                    flow.nat_destination_ip = Some(mapping.destination_ip.to_string());
+                    flow.nat_destination_port = Some(mapping.destination_port);
+                }
+                flow.connection_state = entry.state;
+            }
+        }
+
+        Ok(batch)
+    }
 }
 
 /// 校验批次：禁止重复 flow_id，且每条 flow 必须通过领域校验。
@@ -411,11 +461,6 @@ impl TcEbpfCollector {
             17 => "udp",
             _ => "unknown",
         };
-        let direction = if key.direction == 0 {
-            FlowDirection::Upload
-        } else {
-            FlowDirection::Download
-        };
         let client_ip = std::net::Ipv4Addr::from(u32::from_be(key.client_ip));
         let destination_ip = std::net::Ipv4Addr::from(u32::from_be(key.destination_ip));
         let first_seen = monotonic_timestamp_ms(now_ns, value.first_seen_ns, observed_at_ms);
@@ -426,7 +471,7 @@ impl TcEbpfCollector {
             first_seen,
             last_seen,
             protocol: protocol.to_owned(),
-            direction,
+            direction: FlowDirection::Bidirectional,
             lan_interface: self.lan_interface.clone(),
             wan_interface: self.wan_interface.clone(),
             client_mac: format_mac(key.client_mac),
@@ -442,38 +487,22 @@ impl TcEbpfCollector {
             download_bytes: value.download_bytes,
             packet_count: value.packet_count,
             domain: None,
-            connection_state: ConnectionState::Established,
+            connection_state: ConnectionState::Unknown,
         }
     }
 
     fn flow_id(&self, key: &EbpfFlowKey, value: &EbpfFlowValue) -> String {
         format!(
-            "tc:v1:{}:{:x}:{}:{}:{}:{}:{}:{}:{}",
+            "tc:v1:{}:{:x}:{}:{}:{}:{}:{}:{}",
             self.session_id,
             value.first_seen_ns,
             format_mac(key.client_mac),
-            key.direction,
             key.protocol,
             u32::from_be(key.client_ip),
             u16::from_be(key.client_port),
             u32::from_be(key.destination_ip),
             u16::from_be(key.destination_port),
         )
-    }
-}
-
-#[allow(dead_code)]
-pub struct ConntrackCollector;
-
-impl FlowCollector for ConntrackCollector {
-    /// 返回 conntrack 数据源名称。
-    fn source_name(&self) -> &'static str {
-        "conntrack"
-    }
-
-    /// conntrack 采集占位（尚未实现）。
-    fn collect(&self) -> CollectionResult {
-        source_unavailable(self.source_name(), "collector is not implemented")
     }
 }
 
@@ -562,7 +591,7 @@ impl FlowCollector for SimulatedCollector {
                 first_seen: self.start_ms,
                 last_seen,
                 protocol: "tcp".into(),
-                direction: FlowDirection::Upload,
+                direction: FlowDirection::Bidirectional,
                 lan_interface: "br-lan".into(),
                 wan_interface: "eth0".into(),
                 client_mac: "aa:bb:cc:dd:ee:01".into(),
@@ -591,7 +620,7 @@ impl FlowCollector for SimulatedCollector {
                 first_seen: self.start_ms,
                 last_seen,
                 protocol: "tcp".into(),
-                direction: FlowDirection::Download,
+                direction: FlowDirection::Bidirectional,
                 lan_interface: "br-lan".into(),
                 wan_interface: "eth0".into(),
                 client_mac: "aa:bb:cc:dd:ee:02".into(),
@@ -670,6 +699,33 @@ fn format_mac(mac: [u8; 6]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conntrack::{ConntrackEntry, ConntrackReader, ConntrackSnapshot, NetworkTuple};
+
+    struct FixedConntrackReader {
+        result: Result<ConntrackSnapshot, String>,
+    }
+
+    impl ConntrackReader for FixedConntrackReader {
+        fn snapshot(&self) -> Result<ConntrackSnapshot, String> {
+            self.result.clone()
+        }
+    }
+
+    fn conntrack_entry_for(flow: &Flow) -> ConntrackEntry {
+        let original = NetworkTuple::from_flow(flow).expect("simulated flow has a tuple");
+        ConntrackEntry {
+            original,
+            reply: NetworkTuple {
+                protocol: original.protocol,
+                source_ip: original.destination_ip,
+                source_port: original.destination_port,
+                destination_ip: "198.51.100.10".parse().unwrap(),
+                destination_port: 50_001,
+            },
+            state: ConnectionState::Established,
+        }
+    }
+
     #[test]
     fn simulator_keeps_flow_ids_and_increments_counters() {
         let collector = SimulatedCollector::with_start_time(1_700_000_000_000);
@@ -706,6 +762,53 @@ mod tests {
             failure.error,
             CollectorError::SourceUnavailable { .. }
         ));
+    }
+
+    #[test]
+    fn conntrack_enrichment_adds_nat_and_state_without_changing_flow_id() {
+        let base = Arc::new(SimulatedCollector::with_start_time(1_700_000_000_000));
+        let first_batch = base.collect().unwrap();
+        let first_flow_id = first_batch.flows[0].flow_id.clone();
+        let snapshot =
+            ConntrackSnapshot::from_entries(vec![conntrack_entry_for(&first_batch.flows[0])]);
+        let collector = ConntrackEnrichedCollector::new(
+            base,
+            Arc::new(FixedConntrackReader {
+                result: Ok(snapshot),
+            }),
+        );
+
+        let batch = collector.collect().unwrap();
+        let flow = batch
+            .flows
+            .iter()
+            .find(|flow| flow.flow_id == first_flow_id)
+            .unwrap();
+        assert_eq!(flow.nat_source_ip.as_deref(), Some("198.51.100.10"));
+        assert_eq!(flow.nat_source_port, Some(50_001));
+        assert_eq!(flow.nat_destination_ip.as_deref(), Some("93.184.216.34"));
+        assert_eq!(flow.nat_destination_port, Some(443));
+        assert_eq!(flow.connection_state, ConnectionState::Established);
+    }
+
+    #[test]
+    fn conntrack_failure_keeps_tc_flows_and_marks_batch_degraded() {
+        let base = Arc::new(SimulatedCollector::with_start_time(1_700_000_000_000));
+        let collector = ConntrackEnrichedCollector::new(
+            base,
+            Arc::new(FixedConntrackReader {
+                result: Err("permission denied".into()),
+            }),
+        );
+
+        let batch = collector.collect().unwrap();
+        assert_eq!(batch.flows.len(), 2);
+        assert_eq!(batch.health.flows_emitted, 2);
+        assert_eq!(batch.health.state, CollectorHealthState::Degraded);
+        assert_eq!(
+            batch.health.last_error.as_deref(),
+            Some("permission denied")
+        );
     }
 
     #[test]

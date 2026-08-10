@@ -13,6 +13,8 @@ pub struct Config {
     pub lan_interface: String,
     pub wan_interface: String,
     pub collector_interval_secs: u64,
+    pub conntrack_enabled: bool,
+    pub conntrack_refresh_interval_secs: u64,
 }
 
 impl Config {
@@ -52,6 +54,16 @@ impl Config {
                 .and_then(|value| value.parse().ok())
                 .filter(|value| *value > 0)
                 .unwrap_or(5),
+            conntrack_enabled: std::env::var("ROUTESCOPE_ENABLE_CONNTRACK")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            conntrack_refresh_interval_secs: std::env::var(
+                "ROUTESCOPE_CONNTRACK_REFRESH_INTERVAL_SECS",
+            )
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(5),
         }
     }
 }

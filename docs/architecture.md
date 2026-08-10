@@ -72,27 +72,27 @@ flowchart LR
 
             subgraph UPLOAD["上行路径：LAN → WAN"]
                 direction LR
-                LAN_IN["LAN ingress<br/>TC eBPF hook"]
+                LAN_IN["LAN ingress<br/>TC eBPF 计费点"]
                 U_META["提取 LAN 侧原始元数据<br/>client MAC/IP:port、目标 IP:port<br/>协议、报文长度、时间戳"]
                 U_ROUTE["Linux 路由与转发<br/>选择 WAN 出口"]
                 U_CT["conntrack 查找 / 创建<br/>记录 TCP/UDP 连接状态"]
                 U_FW["nftables forward<br/>按规则放行 / 丢弃"]
                 U_SNAT["nftables NAT<br/>SNAT：私网源地址 → 公网源地址"]
-                WAN_OUT["WAN egress<br/>TC eBPF hook"]
-                U_POST["提取 WAN 侧 NAT 后元数据<br/>translated tuple、出口接口"]
+                WAN_OUT["WAN egress<br/>仅用于转发 / NAT"]
+                U_POST["提取 WAN 侧 NAT 后元数据<br/>由 conntrack 旁路关联"]
 
                 LAN_IN --> U_META --> U_ROUTE --> U_CT --> U_FW --> U_SNAT --> WAN_OUT --> U_POST
             end
 
             subgraph DOWNLOAD["下行路径：WAN → LAN"]
                 direction LR
-                WAN_IN["WAN ingress<br/>TC eBPF hook"]
-                D_META["提取 WAN 侧 NAT 后元数据<br/>公网五元组、入口接口、时间戳"]
+                WAN_IN["WAN ingress<br/>仅用于转发 / NAT"]
+                D_META["提取 WAN 侧 NAT 后元数据<br/>由 conntrack 旁路关联"]
                 D_CT["conntrack 反向查找<br/>恢复原始连接与 NAT 映射"]
                 D_DNAT["nftables NAT<br/>反向 DNAT：公网目标 → LAN 客户端"]
                 D_ROUTE["Linux 路由与转发<br/>选择 LAN 出口"]
                 D_FW["nftables forward<br/>按规则放行 / 丢弃"]
-                LAN_OUT["LAN egress<br/>TC eBPF hook"]
+                LAN_OUT["LAN egress<br/>TC eBPF 计费点"]
                 D_POST["提取 LAN 侧还原后元数据<br/>client MAC/IP:port、LAN 接口"]
 
                 WAN_IN --> D_META --> D_CT --> D_DNAT --> D_ROUTE --> D_FW --> LAN_OUT --> D_POST
@@ -114,12 +114,12 @@ flowchart LR
 
         subgraph OBSERVABILITY["用户态采集、归因与存储"]
             direction TB
-            BPF_MAPS["TC eBPF maps<br/>per-flow / per-device counters<br/>按 CPU 聚合"]
+            BPF_MAPS["LAN TC eBPF maps<br/>双向 per-flow counters<br/>按 skb->len 计费"]
             EVENT_PIPE["观测数据读取<br/>周期性读取 map / 统计快照<br/>不保存原始网络包"]
-            CT_EXPORT["conntrack 查询<br/>NAT 前后映射、connection_state"]
-            COLLECTOR["Rust collector<br/>校验事件、补齐接口与方向"]
+            CT_EXPORT["conntrack netlink snapshot<br/>NAT 前后映射、connection_state"]
+            COLLECTOR["Rust collector<br/>校验 Flow、关联 NAT 与状态"]
             DEVICE_ID["设备身份解析<br/>MAC 为稳定主键<br/>DHCP / ARP / 手动名称"]
-            FLOW_AGG["Flow 聚合器<br/>五元组、方向、NAT 映射<br/>字节数、包数、首末时间"]
+            FLOW_AGG["双向 Flow 聚合器<br/>五元组、上下行计数、NAT 映射<br/>字节数、包数、首末时间"]
             DOMAIN_JOIN["域名关联器<br/>按 client + target IP + TTL<br/>记录 domain_source / confidence"]
             REALTIME["实时统计视图<br/>设备 / Flow / 域名 Top"]
             SQLITE["SQLite 持久化<br/>Flow 连接明细：24h<br/>设备 / 域名分钟聚合：30d"]
@@ -140,10 +140,8 @@ flowchart LR
     LAN_IF --> LAN_IN
     LAN_OUT --> LAN_IF
 
-    U_META -.->|采集| BPF_MAPS
-    U_POST -.->|采集| BPF_MAPS
-    D_META -.->|采集| BPF_MAPS
-    D_POST -.->|采集| BPF_MAPS
+    U_META -.->|LAN upload 计费| BPF_MAPS
+    D_POST -.->|LAN download 计费| BPF_MAPS
     U_CT -.->|状态 / NAT| CT_EXPORT
     D_CT -.->|状态 / NAT| CT_EXPORT
 
@@ -159,7 +157,7 @@ flowchart LR
     classDef storage fill:#fce4d6,stroke:#c55a11,color:#000;
 
     class UPSTREAM,WAN_IF,LAN_IF,CLIENTS edge;
-    class LAN_IN,WAN_IN,LAN_OUT,WAN_OUT hook;
+    class LAN_IN,LAN_OUT hook;
     class U_META,U_ROUTE,U_CT,U_FW,U_SNAT,U_POST,D_META,D_CT,D_DNAT,D_ROUTE,D_FW,D_POST process;
     class BPF_MAPS,EVENT_PIPE,CT_EXPORT,COLLECTOR,DEVICE_ID,FLOW_AGG,DOMAIN_JOIN,REALTIME,API process;
     class DNS_MATCH,DNS_PROXY,DNS_UP,DNS_CACHE side;
@@ -170,24 +168,29 @@ flowchart LR
 
 ## 4. 数据采集架构
 
+LAN 接口是唯一计费点：TC eBPF 在 ingress/egress 按 `skb->len` 累计双向字节，WAN 侧不重复计费。conntrack 与 DNS 只做旁路关联，不参与字节统计。
+
 ```text
-LAN/WAN 接口
+LAN 接口（唯一计费点）
    │
-   ├── TC eBPF ingress/egress
-   │      └── 提取五元组、方向、报文长度、时间戳、接口信息
+   ├── TC eBPF ingress / egress
+   │      ├── 客户端视角五元组、MAC、协议、接口
+   │      ├── 按 skb->len 写入 per-flow map（上下行独立计数）
+   │      └── 用户态周期性读取 map 快照（不保存原始报文）
    │
-   ├── nftables + conntrack
-   │      └── 跟踪连接状态与 NAT 前后映射
+   ├── conntrack netlink（旁路）
+   │      └── 只读快照：NAT 前后映射、connection_state → 补齐 Flow
    │
-   ├── DNS 代理
-   │      └── 建立 设备/IP → 域名 → 目标 IP 的短期关联
+   ├── DNS 代理（旁路，后续阶段）
+   │      └── client IP/MAC → domain → target IP（TTL / 置信度）
    │
-   └── 用户态聚合服务
-          ├── 设备识别：MAC 主键、DHCP 租约、ARP 名称与手动名称
-          ├── Flow 聚合与 NAT 关联
-          ├── 实时统计
-          ├── SQLite 历史数据
-          └── API / Web UI
+   └── Rust collector / 观测服务
+          ├── 校验 Flow、关联 NAT 与连接状态
+          ├── 设备识别：MAC 主键；DHCP / ARP / 手动名称仅作展示
+          ├── 双向 Flow 聚合与域名关联
+          ├── 实时统计视图
+          ├── SQLite：Flow 明细 24h；设备 / 域名分钟聚合 30d
+          └── 只读 API / Web UI（仅管理网或 LAN）
 ```
 
 ## 5. 流量记录模型
@@ -217,12 +220,12 @@ connection_state
 
 其中 `client_mac` 是设备归因的稳定键；`client_ip` 是 Flow 建立时的地址快照。Flow 记录还应保留域名归因的置信度和关联时间，以便解释域名展示结果。
 
-方向应以 LAN 设备视角定义：
+Flow 的 `direction` 固定为 `bidirectional`，上下行分别由独立计数器表达。计数方向以 LAN 设备视角定义：
 
 - `upload`：LAN 客户端发送至 WAN；
 - `download`：WAN 返回至 LAN 客户端。
 
-需要同时保留 NAT 前与 NAT 后的连接信息，避免多设备经过 NAT 后无法准确归因。
+TC eBPF 只在 LAN 侧累计字节，WAN 侧不重复计费；conntrack 只负责将原始 tuple 与转换后 tuple 关联。需要同时保留 NAT 前与 NAT 后的连接信息，避免多设备经过 NAT 后无法准确归因。
 
 ## 6. 域名归因
 
@@ -278,8 +281,8 @@ TCP、UDP、DNS 与大流量双向传输
 验证：
 
 - eBPF 程序加载与接口挂载；
-- 五元组、方向与字节统计；
-- NAT 前后 Flow 关联；
+- 客户端视角双向 Flow、上下行与字节统计；
+- conntrack NAT 前后 tuple、连接状态与 Flow 关联；
 - 多客户端设备归因；
 - DNS 域名关联；
 - SQLite 聚合与 API 输出。
@@ -307,7 +310,7 @@ TCP、UDP、DNS 与大流量双向传输
 
 - 在 5–30 台设备、最高 1 Gbps 的家庭网络目标下稳定运行；
 - 设备上下行字节统计可与 LAN/WAN 接口计数进行核对，并记录统计口径和允许误差；
-- 可查询每台设备最近 24 小时的连接明细，包括五元组、方向、字节数和可用的域名归因；
+- 可查询每台设备最近 24 小时的连接明细，包括五元组、双向字节数、NAT 映射、连接状态和可用的域名归因；
 - 可查看每台设备按流量排序的域名 Top，且未知或低置信度关联必须清晰标识；
 - 可查询最近 30 天的分钟级设备和域名聚合趋势。
 
@@ -342,8 +345,8 @@ TC eBPF + conntrack + 用户态聚合
 ## 11. 当前项目文件结构
 
 当前代码已实现领域模型、SQLite 持久化、分钟聚合、只读 API、可选模拟采集，
-以及第一版 TC eBPF IPv4 TCP/UDP 统计和 Linux namespace NAT 集成环境；
-conntrack/DNS 关联和认证仍在后续阶段。
+第一版 TC eBPF IPv4 TCP/UDP 双向 Flow 统计，以及只读 conntrack NAT 关联；
+DNS 代理和认证仍在后续阶段。
 
 ```text
 .
@@ -362,6 +365,7 @@ conntrack/DNS 关联和认证仍在后续阶段。
 │   │   └── mod.rs              # 健康检查与受保护的只读 API 路由
 │   ├── auth.rs                 # 管理认证边界（TODO）
 │   ├── collector.rs            # 真实采集接口与模拟采集器
+│   ├── conntrack.rs            # conntrack netlink 快照与 NAT 关联
 │   ├── routescope_tc.c         # TC eBPF IPv4 TCP/UDP 统计程序
 │   ├── build.rs                # 编译 TC eBPF 对象文件
 │   ├── config.rs               # 监听地址和保留期配置

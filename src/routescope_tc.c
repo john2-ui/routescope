@@ -32,8 +32,8 @@ struct bpf_map_def {
 
 struct flow_key {
     __u8 client_mac[6];
-    __u8 direction;
     __u8 protocol;
+    __u8 padding;
     __u32 client_ip;
     __u32 destination_ip;
     __u16 client_port;
@@ -132,7 +132,6 @@ int record_packet(struct __sk_buff *skb, __u8 direction) {
             : ethernet->h_dest[i];
     }
 
-    key.direction = direction;
     key.protocol = ip->protocol;
 
     if (direction == 0) {

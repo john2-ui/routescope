@@ -2,6 +2,7 @@ mod api;
 mod auth;
 mod collector;
 mod config;
+mod conntrack;
 mod domain;
 mod service;
 mod state;
@@ -9,8 +10,9 @@ mod storage;
 mod web;
 
 use axum::Router;
-use collector::{FlowCollector, SimulatedCollector, TcEbpfCollector};
+use collector::{ConntrackEnrichedCollector, FlowCollector, SimulatedCollector, TcEbpfCollector};
 use config::Config;
+use conntrack::{CachedConntrackReader, NetlinkConntrackReader};
 use service::ObservationService;
 use state::AppState;
 use std::error::Error;
@@ -58,13 +60,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             config.simulator_interval_secs,
         ))
     } else if config.tc_ebpf_enabled {
-        Some((
-            Arc::new(TcEbpfCollector::new(
-                config.lan_interface.clone(),
-                config.wan_interface.clone(),
-            )?),
-            config.collector_interval_secs,
-        ))
+        let tc_collector: Arc<dyn FlowCollector> = Arc::new(TcEbpfCollector::new(
+            config.lan_interface.clone(),
+            config.wan_interface.clone(),
+        )?);
+        let collector: Arc<dyn FlowCollector> = if config.conntrack_enabled {
+            Arc::new(ConntrackEnrichedCollector::new(
+                tc_collector,
+                Arc::new(CachedConntrackReader::new(
+                    Arc::new(NetlinkConntrackReader),
+                    Duration::from_secs(config.conntrack_refresh_interval_secs.max(1)),
+                )),
+            ))
+        } else {
+            tc_collector
+        };
+
+        Some((collector, config.collector_interval_secs))
     } else {
         None
     };

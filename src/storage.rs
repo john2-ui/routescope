@@ -324,6 +324,16 @@ impl RouteScopeRepository for SqliteRepository {
                     upload_bytes = excluded.upload_bytes,
                     download_bytes = excluded.download_bytes,
                     packet_count = excluded.packet_count,
+                    nat_source_ip = COALESCE(excluded.nat_source_ip, flows.nat_source_ip),
+                    nat_source_port = COALESCE(excluded.nat_source_port, flows.nat_source_port),
+                    nat_destination_ip = COALESCE(
+                        excluded.nat_destination_ip,
+                        flows.nat_destination_ip
+                    ),
+                    nat_destination_port = COALESCE(
+                        excluded.nat_destination_port,
+                        flows.nat_destination_port
+                    ),
                     domain = excluded.domain,
                     domain_source = excluded.domain_source,
                     domain_confidence = excluded.domain_confidence,
@@ -625,7 +635,7 @@ mod tests {
             first_seen: last_seen - 1_000,
             last_seen,
             protocol: "tcp".to_string(),
-            direction: FlowDirection::Upload,
+            direction: FlowDirection::Bidirectional,
             lan_interface: "br-lan".to_string(),
             wan_interface: "eth0".to_string(),
             client_mac: mac.to_string(),
@@ -824,6 +834,34 @@ mod tests {
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].upload_bytes, flow.upload_bytes);
         assert_eq!(stats[0].download_bytes, flow.download_bytes);
+    }
+
+    #[test]
+    fn delayed_nat_enrichment_preserves_counters_and_fills_mapping() {
+        let repo = SqliteRepository::open_in_memory().unwrap();
+        let mac = "aa:bb:cc:dd:ee:ff";
+        let mut flow = sample_flow("flow-nat-delay", mac, 125_000);
+        flow.nat_source_ip = None;
+        flow.nat_source_port = None;
+        flow.nat_destination_ip = None;
+        flow.nat_destination_port = None;
+        flow.upload_bytes = 1_000;
+        flow.download_bytes = 2_000;
+
+        repo.upsert_flow(&flow).unwrap();
+        let stats_before = repo.list_device_minute_stats(mac, 0).unwrap();
+
+        flow.nat_source_ip = Some("203.0.113.10".into());
+        flow.nat_source_port = Some(40_001);
+        flow.nat_destination_ip = Some("93.184.216.34".into());
+        flow.nat_destination_port = Some(443);
+        repo.upsert_flow(&flow).unwrap();
+
+        let loaded = repo.list_recent_flows(mac).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].nat_source_port, Some(40_001));
+        assert_eq!(loaded[0].nat_destination_port, Some(443));
+        assert_eq!(repo.list_device_minute_stats(mac, 0).unwrap(), stats_before);
     }
 
     #[test]

@@ -6,14 +6,15 @@ Linux 软路由流量观测与统计工具。
 
 项目目前是可启动的 Rust 服务，已实现领域模型、SQLite 存储、分钟聚合、只读 API
 以及可选的模拟采集闭环。第一版 TC eBPF 采集器已经接入，可在 Linux namespace
-拓扑中采集 LAN ingress/egress 上的 IPv4 TCP/UDP Flow；conntrack/NAT 关联、DNS
-代理和本地账户认证仍在后续阶段。
+拓扑中采集 LAN ingress/egress 上的 IPv4 TCP/UDP 双向 Flow，并可选通过只读
+conntrack netlink 快照补齐 NAT 关联；DNS 代理和本地账户认证仍在后续阶段。
 
 - `GET /healthz` 可用于健康检查；
 - `/login` 是公开的登录页面骨架；
 - 设置 `ROUTESCOPE_DEV_BYPASS_AUTH=1` 后可在本地联调 `/api/v1/*` 只读接口；
 - 设置 `ROUTESCOPE_ENABLE_SIMULATOR=1` 后，服务会周期性写入可重复的测试 Flow；
 - 设置 `ROUTESCOPE_ENABLE_TC_EBPF=1` 后可启用 TC eBPF 采集器；
+- 设置 `ROUTESCOPE_ENABLE_CONNTRACK=1` 后可在 TC eBPF Flow 上启用 conntrack NAT 关联；
 - TC eBPF 需要 root、clang、BPF-capable Linux 内核，并且只能在已准备好的路由
   namespace 或真实软路由上启用；
 - 正式认证尚未实现，生产环境不得开启开发绕过。
@@ -51,14 +52,15 @@ sudo make namespace-down
 该环境创建 `client-a/client-b → router → wan` 拓扑，验证两台客户端经
 IPv4 NAT 访问 WAN namespace 的 HTTP 服务。`make namespace-collector-test`
 会先构建当前 RouteScope，再在 router namespace 内启动服务，验证真实 TC
-eBPF Flow 能按客户端 MAC 出现在 API 中。
+eBPF 双向 Flow 能按客户端 MAC 出现在 API 中，并在启用 conntrack 时补齐 NAT 映射。
 
 ## 项目结构
 
 ```text
 src/api/       HTTP API 路由
 src/auth.rs    管理认证边界（TODO）
-src/collector.rs TC eBPF、conntrack、DNS 采集接口与模拟采集器
+src/collector.rs TC eBPF、采集管线与模拟采集器
+src/conntrack.rs conntrack netlink 快照与 NAT 关联
 src/routescope_tc.c TC eBPF IPv4 TCP/UDP 统计程序
 build.rs          编译 TC eBPF 对象文件
 src/domain.rs  Device、Flow 和域名归因领域模型

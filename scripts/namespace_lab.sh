@@ -16,9 +16,12 @@ CLIENT_B_IP="10.0.0.11"
 LAN_ROUTER_IP="10.0.0.1"
 WAN_ROUTER_IP="10.0.2.1"
 WAN_SERVER_IP="10.0.2.2"
+UDP_SERVER_PORT="9090"
 
 HTTP_SERVER_PID=""
 HTTP_SERVER_LOG=""
+UDP_SERVER_PID=""
+UDP_SERVER_LOG=""
 ROUTESCOPE_PID=""
 ROUTESCOPE_LOG=""
 ROUTESCOPE_DB=""
@@ -214,6 +217,16 @@ stop_wan_http_processes() {
     ns_exec "$WAN_NS" pkill -KILL -f 'python3.*http.server 8080' 2>/dev/null || true
 }
 
+stop_wan_udp_processes() {
+    if ! namespace_exists "$WAN_NS"; then
+        return 0
+    fi
+
+    ns_exec "$WAN_NS" pkill -TERM -f 'routescope-udp-server' 2>/dev/null || true
+    sleep 0.1
+    ns_exec "$WAN_NS" pkill -KILL -f 'routescope-udp-server' 2>/dev/null || true
+}
+
 stop_routescope_processes() {
     if ! namespace_exists "$ROUTER_NS"; then
         return 0
@@ -239,11 +252,23 @@ cleanup_http_server() {
         HTTP_SERVER_PID=""
     fi
 
+    if [[ -n "$UDP_SERVER_PID" ]]; then
+        kill "$UDP_SERVER_PID" 2>/dev/null || true
+        wait "$UDP_SERVER_PID" 2>/dev/null || true
+        UDP_SERVER_PID=""
+    fi
+
     stop_wan_http_processes
+    stop_wan_udp_processes
 
     if [[ -n "$HTTP_SERVER_LOG" ]]; then
         rm -f "$HTTP_SERVER_LOG"
         HTTP_SERVER_LOG=""
+    fi
+
+    if [[ -n "$UDP_SERVER_LOG" ]]; then
+        rm -f "$UDP_SERVER_LOG"
+        UDP_SERVER_LOG=""
     fi
 }
 
@@ -288,9 +313,11 @@ start_routescope_collector() {
         ROUTESCOPE_DEV_BYPASS_AUTH=1 \
         ROUTESCOPE_ENABLE_SIMULATOR=0 \
         ROUTESCOPE_ENABLE_TC_EBPF=1 \
+        ROUTESCOPE_ENABLE_CONNTRACK=1 \
         ROUTESCOPE_LAN_INTERFACE=br-lan \
         ROUTESCOPE_WAN_INTERFACE=wan0 \
         ROUTESCOPE_COLLECT_INTERVAL_SECS=1 \
+        ROUTESCOPE_CONNTRACK_REFRESH_INTERVAL_SECS=1 \
         "$ROOT/target/debug/routescope" \
         >"$ROUTESCOPE_LOG" 2>&1 &
     ROUTESCOPE_PID=$!
@@ -334,20 +361,43 @@ print("ok: collector observed both namespace clients")
 
 assert_collector_flow() {
     local mac_address=$1
-    local flows_json=$2
+    local protocol=$2
+    local destination_port=$3
+    local flows_json=$4
 
     python3 -c '
 import json
 import sys
 
-mac = sys.argv[1]
+mac, protocol, destination_port = sys.argv[1], sys.argv[2], int(sys.argv[3])
 data = json.load(sys.stdin)
-if not data:
-    raise SystemExit(f"no flows for {mac}")
-if not any(flow["client_mac"] == mac and flow["packet_count"] > 0 for flow in data):
-    raise SystemExit(f"no packet-bearing flow for {mac}: {data}")
-print(f"ok: collector produced flows for {mac}")
-' "$mac_address" <<<"$flows_json"
+matches = [
+    flow for flow in data
+    if flow["client_mac"] == mac
+    and flow["protocol"] == protocol
+    and flow["destination_port"] == destination_port
+]
+if len(matches) != 1:
+    raise SystemExit(
+        f"expected one {protocol}:{destination_port} flow for {mac}, "
+        f"got {len(matches)}: {data}"
+    )
+
+flow = matches[0]
+if flow["direction"] != "bidirectional":
+    raise SystemExit(f"flow is not bidirectional: {flow}")
+if flow["packet_count"] <= 0 or flow["upload_bytes"] <= 0 or flow["download_bytes"] <= 0:
+    raise SystemExit(f"flow does not contain both directions: {flow}")
+if flow["nat_source_ip"] != "10.0.2.1" or not flow["nat_source_port"]:
+    raise SystemExit(f"missing or invalid SNAT mapping: {flow}")
+if flow["nat_destination_ip"] != "10.0.2.2":
+    raise SystemExit(f"unexpected translated destination: {flow}")
+if flow["nat_destination_port"] != destination_port:
+    raise SystemExit(f"unexpected translated destination port: {flow}")
+if flow["connection_state"] == "unknown":
+    raise SystemExit(f"conntrack state was not associated: {flow}")
+print(f"ok: bidirectional {protocol}:{destination_port} flow with NAT for {mac}")
+' "$mac_address" "$protocol" "$destination_port" <<<"$flows_json"
 }
 
 test_collector_api() {
@@ -381,15 +431,19 @@ test_collector_api() {
 
         if [[ -n "$laptop_flows" ]] \
             && [[ -n "$phone_flows" ]] \
-            && assert_collector_flow "$CLIENT_A_MAC" "$laptop_flows" >/dev/null 2>&1 \
-            && assert_collector_flow "$CLIENT_B_MAC" "$phone_flows" >/dev/null 2>&1; then
+            && assert_collector_flow "$CLIENT_A_MAC" tcp 8080 "$laptop_flows" >/dev/null 2>&1 \
+            && assert_collector_flow "$CLIENT_B_MAC" tcp 8080 "$phone_flows" >/dev/null 2>&1 \
+            && assert_collector_flow "$CLIENT_A_MAC" udp "$UDP_SERVER_PORT" "$laptop_flows" >/dev/null 2>&1 \
+            && assert_collector_flow "$CLIENT_B_MAC" udp "$UDP_SERVER_PORT" "$phone_flows" >/dev/null 2>&1; then
             break
         fi
         sleep 0.2
     done
 
-    assert_collector_flow "$CLIENT_A_MAC" "$laptop_flows"
-    assert_collector_flow "$CLIENT_B_MAC" "$phone_flows"
+    assert_collector_flow "$CLIENT_A_MAC" tcp 8080 "$laptop_flows"
+    assert_collector_flow "$CLIENT_B_MAC" tcp 8080 "$phone_flows"
+    assert_collector_flow "$CLIENT_A_MAC" udp "$UDP_SERVER_PORT" "$laptop_flows"
+    assert_collector_flow "$CLIENT_B_MAC" udp "$UDP_SERVER_PORT" "$phone_flows"
 }
 
 test_client_http() {
@@ -437,6 +491,63 @@ test_client_http() {
     fi
 
     echo "ok: $client_name reached WAN through NAT"
+}
+
+start_wan_udp_server() {
+    UDP_SERVER_LOG="${TMPDIR:-/tmp}/routescope-wan-udp.$$.log"
+    : >"$UDP_SERVER_LOG"
+
+    ns_exec "$WAN_NS" python3 -u -c '
+import socket
+
+server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+server.bind(("10.0.2.2", 9090))
+print("routescope-udp-server-ready", flush=True)
+while True:
+    payload, address = server.recvfrom(65535)
+    server.sendto(b"routescope-udp-response:" + payload, address)
+' >"$UDP_SERVER_LOG" 2>&1 &
+    UDP_SERVER_PID=$!
+
+    for _ in {1..20}; do
+        if awk '/routescope-udp-server-ready/ { found = 1 } END { exit !found }' \
+            "$UDP_SERVER_LOG"; then
+            return 0
+        fi
+        if ! kill -0 "$UDP_SERVER_PID" 2>/dev/null; then
+            echo "error: UDP server exited before becoming ready. Log:" >&2
+            cat "$UDP_SERVER_LOG" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+
+    echo "error: UDP server did not become ready. Log:" >&2
+    cat "$UDP_SERVER_LOG" >&2
+    return 1
+}
+
+test_client_udp() {
+    local namespace=$1
+    local client_name=$2
+
+    ns_exec "$namespace" python3 - "$WAN_SERVER_IP" "$UDP_SERVER_PORT" <<'PY'
+import socket
+import sys
+
+server_ip = sys.argv[1]
+server_port = int(sys.argv[2])
+payload = b"routescope-udp-request"
+
+client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+client.settimeout(2)
+client.sendto(payload, (server_ip, server_port))
+response, _ = client.recvfrom(65535)
+if response != b"routescope-udp-response:" + payload:
+    raise SystemExit(f"unexpected UDP response: {response!r}")
+PY
+
+    echo "ok: $client_name exchanged UDP traffic through NAT"
 }
 
 test_topology() {
@@ -487,8 +598,17 @@ test_collector() {
         >"$HTTP_SERVER_LOG" 2>&1 &
     HTTP_SERVER_PID=$!
 
-    test_client_http "$CLIENT_A_NS" "client-a"
-    test_client_http "$CLIENT_B_NS" "client-b"
+    start_wan_udp_server
+
+    test_client_http "$CLIENT_A_NS" "client-a" &
+    local client_a_http_pid=$!
+    test_client_http "$CLIENT_B_NS" "client-b" &
+    local client_b_http_pid=$!
+    wait "$client_a_http_pid"
+    wait "$client_b_http_pid"
+
+    test_client_udp "$CLIENT_A_NS" "client-a"
+    test_client_udp "$CLIENT_B_NS" "client-b"
     test_collector_api
 
     echo "namespace TC eBPF collector test passed"

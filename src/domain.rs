@@ -71,6 +71,16 @@ impl Flow {
             return Err("first_seen must not be after last_seen");
         }
 
+        let nat_fields = [
+            self.nat_source_ip.is_some(),
+            self.nat_source_port.is_some(),
+            self.nat_destination_ip.is_some(),
+            self.nat_destination_port.is_some(),
+        ];
+        if nat_fields.iter().any(|present| *present) && !nat_fields.iter().all(|present| *present) {
+            return Err("NAT mapping fields must be provided together");
+        }
+
         Ok(())
     }
 }
@@ -136,6 +146,7 @@ impl Error for CounterReset {}
 pub enum FlowDirection {
     Upload,
     Download,
+    Bidirectional,
 }
 
 impl FlowDirection {
@@ -144,6 +155,7 @@ impl FlowDirection {
         match self {
             Self::Upload => "upload",
             Self::Download => "download",
+            Self::Bidirectional => "bidirectional",
         }
     }
 
@@ -152,6 +164,7 @@ impl FlowDirection {
         match value {
             "upload" => Some(Self::Upload),
             "download" => Some(Self::Download),
+            "bidirectional" => Some(Self::Bidirectional),
             _ => None,
         }
     }
@@ -289,7 +302,7 @@ mod tests {
             first_seen: 1_000,
             last_seen: 2_000,
             protocol: "tcp".to_string(),
-            direction: FlowDirection::Upload,
+            direction: FlowDirection::Bidirectional,
             lan_interface: "br-lan".to_string(),
             wan_interface: "eth0".to_string(),
             client_mac: "aa:bb:cc:dd:ee:ff".to_string(),
@@ -339,19 +352,28 @@ mod tests {
     }
 
     #[test]
-    fn direction_uses_lan_client_perspective() {
+    fn bidirectional_flow_uses_lan_client_perspective() {
         let upload = valid_flow();
-        assert_eq!(upload.direction, FlowDirection::Upload);
-        let mut download = valid_flow();
-        download.direction = FlowDirection::Download;
-        assert_eq!(download.direction, FlowDirection::Download);
+        assert_eq!(upload.direction, FlowDirection::Bidirectional);
+        assert_eq!(upload.upload_bytes, 1_024);
+        assert_eq!(upload.download_bytes, 256);
+    }
+
+    #[test]
+    fn flow_rejects_partial_nat_mapping() {
+        let mut flow = valid_flow();
+        flow.nat_destination_port = None;
+        assert_eq!(
+            flow.validate(),
+            Err("NAT mapping fields must be provided together")
+        );
     }
     #[test]
     fn flow_serializes_expected_field_names() {
         let json = serde_json::to_value(valid_flow()).unwrap();
         assert_eq!(json["flow_id"], "flow-1");
         assert_eq!(json["client_mac"], "aa:bb:cc:dd:ee:ff");
-        assert_eq!(json["direction"], "upload");
+        assert_eq!(json["direction"], "bidirectional");
         assert_eq!(json["domain"]["source"], "dns");
         assert_eq!(json["domain"]["confidence"], "high");
         assert_eq!(json["connection_state"], "established");
