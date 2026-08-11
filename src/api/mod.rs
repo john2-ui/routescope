@@ -38,10 +38,9 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
 /// process liveness failure.
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let collector = state.collector_health.snapshot();
-    let status = if collector.state == "unhealthy" {
-        "degraded"
-    } else {
-        "ok"
+    let status = match collector.state.as_str() {
+        "unhealthy" | "degraded" => "degraded",
+        _ => "ok",
     };
     Json(serde_json::json!({
         "status": status,

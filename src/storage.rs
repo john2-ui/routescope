@@ -159,8 +159,10 @@ impl SqliteRepository {
             "#,
             )?;
         }
+        // Keep schema changes and user_version in the same transaction so a
+        // failed migration cannot leave the database marked as upgraded.
+        tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         tx.commit()?;
-        conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -820,6 +822,44 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn failed_migration_transaction_does_not_bump_schema_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_connection(&conn, false).unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute_batch(
+                r#"
+                CREATE TABLE devices (
+                    mac_address TEXT PRIMARY KEY NOT NULL,
+                    display_name TEXT,
+                    current_ip TEXT,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+            tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
+                .unwrap();
+            // Simulate a later DDL statement failing before commit.
+            assert!(
+                tx.execute_batch("CREATE TABLE devices (mac_address TEXT PRIMARY KEY NOT NULL);")
+                    .is_err()
+            );
+        }
+
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0);
+        let devices_exists: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'devices'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!devices_exists);
     }
 
     #[test]

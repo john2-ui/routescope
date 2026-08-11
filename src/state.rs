@@ -81,7 +81,8 @@ impl CollectorHealthTracker {
                 snapshot.ready = health.state != CollectorHealthState::Unhealthy;
             }
             Err(error) => {
-                snapshot.state = CollectorHealthState::Degraded.as_str().to_owned();
+                // Preserve collector-reported state; storage failures are tracked
+                // via ready/last_error/consecutive_failures instead.
                 snapshot.consecutive_failures = snapshot.consecutive_failures.saturating_add(1);
                 snapshot.last_error = Some(error);
                 snapshot.ready = false;
@@ -151,5 +152,25 @@ mod tests {
         let snapshot = tracker.snapshot();
         assert_eq!(snapshot.state, "healthy");
         assert!(snapshot.ready);
+    }
+
+    #[test]
+    fn ingest_failure_preserves_collector_state() {
+        let tracker = CollectorHealthTracker::new(Some("simulated"));
+        tracker.record_batch(
+            &CollectorHealth {
+                state: CollectorHealthState::Healthy,
+                observed_at_ms: 1_000,
+                flows_seen: 2,
+                flows_emitted: 2,
+                last_error: None,
+            },
+            Err("disk full".to_owned()),
+        );
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.state, "healthy");
+        assert!(!snapshot.ready);
+        assert_eq!(snapshot.consecutive_failures, 1);
+        assert_eq!(snapshot.last_error.as_deref(), Some("disk full"));
     }
 }

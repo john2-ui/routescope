@@ -19,7 +19,7 @@ pub struct Device {
 /// Normalize a user-provided device name; an empty value clears the name.
 pub fn normalize_display_name(value: Option<&str>) -> Result<Option<String>, &'static str> {
     let value = value.unwrap_or("").trim();
-    if value.len() > 128 || value.chars().any(char::is_control) {
+    if value.chars().count() > 128 || value.chars().any(char::is_control) {
         return Err("display name must be at most 128 non-control characters");
     }
 
@@ -410,5 +410,15 @@ mod tests {
         );
         assert_eq!(normalize_display_name(Some("   ")).unwrap(), None);
         assert!(normalize_display_name(Some("bad\nname")).is_err());
+    }
+
+    #[test]
+    fn display_name_limit_counts_unicode_characters() {
+        let accepted = "测".repeat(128);
+        assert_eq!(
+            normalize_display_name(Some(&accepted)).unwrap(),
+            Some(accepted)
+        );
+        assert!(normalize_display_name(Some(&"测".repeat(129))).is_err());
     }
 }

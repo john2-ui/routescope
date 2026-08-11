@@ -540,6 +540,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_check_reports_degraded_collector_status() {
+        let repo = Arc::new(SqliteRepository::open_in_memory().unwrap());
+        let auth = Arc::new(
+            AuthService::from_repository(Arc::clone(&repo), "admin".to_owned(), None).unwrap(),
+        );
+        let observation = Arc::new(ObservationService::new(repo, 24, 30));
+        let collector_health = Arc::new(CollectorHealthTracker::new(Some("simulated")));
+        collector_health.record_batch(
+            &collector::CollectorHealth {
+                state: collector::CollectorHealthState::Degraded,
+                observed_at_ms: 1_000,
+                flows_seen: 1,
+                flows_emitted: 0,
+                last_error: Some("permission denied".to_owned()),
+            },
+            Ok(0),
+        );
+
+        let response = app(AppState {
+            observation,
+            auth,
+            collector_health,
+            dev_bypass_auth: false,
+            secure_cookies: false,
+        })
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["status"], "degraded");
+        assert_eq!(payload["collector"]["state"], "degraded");
+    }
+
+    #[tokio::test]
     async fn protected_api_requires_authentication() {
         let response = test_app(false)
             .oneshot(
