@@ -3,6 +3,8 @@ mod auth;
 mod collector;
 mod config;
 mod conntrack;
+mod dns;
+mod dns_proxy;
 mod domain;
 mod service;
 mod state;
@@ -13,6 +15,8 @@ use axum::Router;
 use collector::{ConntrackEnrichedCollector, FlowCollector, SimulatedCollector, TcEbpfCollector};
 use config::Config;
 use conntrack::{CachedConntrackReader, NetlinkConntrackReader};
+use dns::{DnsAttributionCache, DnsObservationQueue, DnsObservationSource};
+use dns_proxy::DnsProxy;
 use service::ObservationService;
 use state::AppState;
 use std::error::Error;
@@ -81,10 +85,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
+    let dns_cache = Arc::new(DnsAttributionCache::new());
+    let dns_source_queue = Arc::new(DnsObservationQueue::new());
+    let dns_source: Arc<dyn DnsObservationSource> = dns_source_queue.clone();
+
+    let _dns_task = if config.dns_proxy_enabled {
+        let proxy = DnsProxy::new(
+            config.dns_listen_addr,
+            config.dns_upstream_addr,
+            Duration::from_millis(config.dns_query_timeout_ms.max(1)),
+            Arc::clone(&dns_source_queue),
+        );
+        let proxy = proxy.bind().await.map_err(std::io::Error::other)?;
+        Some(tokio::spawn(async move {
+            if let Err(error) = proxy.run().await {
+                eprintln!("DNS proxy stopped: {error}");
+            }
+        }))
+    } else {
+        None
+    };
+
     let _collector_task = collector.map(|(collector, interval_secs)| {
         tokio::spawn(run_collection_loop(
             Arc::clone(&observation),
             collector,
+            Arc::clone(&dns_cache),
+            Arc::clone(&dns_source),
             interval_secs,
         ))
     });
@@ -114,6 +141,8 @@ fn app(state: AppState) -> Router {
 async fn run_collection_loop(
     observation: Arc<ObservationService>,
     collector: Arc<dyn FlowCollector>,
+    dns_cache: Arc<DnsAttributionCache>,
+    dns_source: Arc<dyn DnsObservationSource>,
     interval_secs: u64,
 ) {
     let mut ticker = time::interval(Duration::from_secs(interval_secs.max(1)));
@@ -122,8 +151,18 @@ async fn run_collection_loop(
     loop {
         ticker.tick().await;
 
+        if let Err(error) = dns_cache.collect_from(dns_source.as_ref()) {
+            eprintln!(
+                "DNS source {} failed to collect observations: {error}",
+                dns_source.source_name()
+            );
+        }
+
         match collector.collect() {
-            Ok(batch) => {
+            Ok(mut batch) => {
+                dns_cache.purge_expired(batch.observed_at_ms);
+                dns_cache.attribute_flows(&mut batch.flows);
+
                 if batch.health.state != collector::CollectorHealthState::Healthy {
                     eprintln!(
                         "collector {} health={:?} observed_at_ms={} error={:?}",

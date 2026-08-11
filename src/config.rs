@@ -15,6 +15,10 @@ pub struct Config {
     pub collector_interval_secs: u64,
     pub conntrack_enabled: bool,
     pub conntrack_refresh_interval_secs: u64,
+    pub dns_proxy_enabled: bool,
+    pub dns_listen_addr: SocketAddr,
+    pub dns_upstream_addr: SocketAddr,
+    pub dns_query_timeout_ms: u64,
 }
 
 impl Config {
@@ -64,6 +68,22 @@ impl Config {
             .and_then(|value| value.parse().ok())
             .filter(|value| *value > 0)
             .unwrap_or(5),
+            dns_proxy_enabled: std::env::var("ROUTESCOPE_ENABLE_DNS_PROXY")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            dns_listen_addr: std::env::var("ROUTESCOPE_DNS_LISTEN_ADDR")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| "127.0.0.1:5353".parse().expect("valid default DNS address")),
+            dns_upstream_addr: std::env::var("ROUTESCOPE_DNS_UPSTREAM_ADDR")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| "1.1.1.1:53".parse().expect("valid default DNS upstream")),
+            dns_query_timeout_ms: std::env::var("ROUTESCOPE_DNS_QUERY_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(2_000),
         }
     }
 }

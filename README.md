@@ -7,7 +7,8 @@ Linux 软路由流量观测与统计工具。
 项目目前是可启动的 Rust 服务，已实现领域模型、SQLite 存储、分钟聚合、只读 API
 以及可选的模拟采集闭环。第一版 TC eBPF 采集器已经接入，可在 Linux namespace
 拓扑中采集 LAN ingress/egress 上的 IPv4 TCP/UDP 双向 Flow，并可选通过只读
-conntrack netlink 快照补齐 NAT 关联；DNS 代理和本地账户认证仍在后续阶段。
+conntrack netlink 快照补齐 NAT 关联；可选的本地 DNS UDP/TCP 转发与 IPv4 域名归因
+已经接入，本地账户认证仍在后续阶段。
 
 - `GET /healthz` 可用于健康检查；
 - `/login` 是公开的登录页面骨架；
@@ -15,6 +16,9 @@ conntrack netlink 快照补齐 NAT 关联；DNS 代理和本地账户认证仍�
 - 设置 `ROUTESCOPE_ENABLE_SIMULATOR=1` 后，服务会周期性写入可重复的测试 Flow；
 - 设置 `ROUTESCOPE_ENABLE_TC_EBPF=1` 后可启用 TC eBPF 采集器；
 - 设置 `ROUTESCOPE_ENABLE_CONNTRACK=1` 后可在 TC eBPF Flow 上启用 conntrack NAT 关联；
+- 设置 `ROUTESCOPE_ENABLE_DNS_PROXY=1` 后可启用本地 DNS 转发器，默认监听
+  `127.0.0.1:5353` 并转发至 `1.1.1.1:53`；生产环境还需用 nftables 将 LAN 的 DNS
+  请求重定向到该端口；
 - TC eBPF 需要 root、clang、BPF-capable Linux 内核，并且只能在已准备好的路由
   namespace 或真实软路由上启用；
 - 正式认证尚未实现，生产环境不得开启开发绕过。
@@ -61,6 +65,8 @@ src/api/       HTTP API 路由
 src/auth.rs    管理认证边界（TODO）
 src/collector.rs TC eBPF、采集管线与模拟采集器
 src/conntrack.rs conntrack netlink 快照与 NAT 关联
+src/dns.rs     DNS observation 队列、TTL 缓存与 Flow 域名归因
+src/dns_proxy.rs 本地 DNS UDP/TCP 转发与 A 记录解析
 src/routescope_tc.c TC eBPF IPv4 TCP/UDP 统计程序
 build.rs          编译 TC eBPF 对象文件
 src/domain.rs  Device、Flow 和域名归因领域模型

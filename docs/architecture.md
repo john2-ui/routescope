@@ -181,7 +181,7 @@ LAN 接口（唯一计费点）
    ├── conntrack netlink（旁路）
    │      └── 只读快照：NAT 前后映射、connection_state → 补齐 Flow
    │
-   ├── DNS 代理（旁路，后续阶段）
+   ├── DNS 代理（旁路，可选）
    │      └── client IP/MAC → domain → target IP（TTL / 置信度）
    │
    └── Rust collector / 观测服务
@@ -345,8 +345,8 @@ TC eBPF + conntrack + 用户态聚合
 ## 11. 当前项目文件结构
 
 当前代码已实现领域模型、SQLite 持久化、分钟聚合、只读 API、可选模拟采集，
-第一版 TC eBPF IPv4 TCP/UDP 双向 Flow 统计，以及只读 conntrack NAT 关联；
-DNS 代理和认证仍在后续阶段。
+第一版 TC eBPF IPv4 TCP/UDP 双向 Flow 统计、只读 conntrack NAT 关联，以及可选
+的本地 DNS UDP/TCP 转发和 IPv4 A 记录域名归因；本地账户认证仍在后续阶段。
 
 ```text
 .
@@ -366,6 +366,8 @@ DNS 代理和认证仍在后续阶段。
 │   ├── auth.rs                 # 管理认证边界（TODO）
 │   ├── collector.rs            # 真实采集接口与模拟采集器
 │   ├── conntrack.rs            # conntrack netlink 快照与 NAT 关联
+│   ├── dns.rs                  # DNS observation 队列、TTL 缓存与 Flow 域名归因
+│   ├── dns_proxy.rs            # 本地 DNS UDP/TCP 转发与 A 记录解析
 │   ├── routescope_tc.c         # TC eBPF IPv4 TCP/UDP 统计程序
 │   ├── build.rs                # 编译 TC eBPF 对象文件
 │   ├── config.rs               # 监听地址和保留期配置

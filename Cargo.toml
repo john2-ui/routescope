@@ -8,11 +8,15 @@ askama = "0.16.0"
 axum = "0.8.9"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "time", "io-util"] }
 rusqlite = {version = "0.32", features = ["bundled"]}
 aya = "0.14.0"
 libc = "0.2.189"
 conntrack = "0.1.5"
+hickory-proto = "0.26.1"
+argon2 = "0.5.3"
+sha2 = "0.11.0"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }

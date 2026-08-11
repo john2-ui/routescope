@@ -284,12 +284,6 @@ fn validate_batch(source: &'static str, flows: Vec<Flow>) -> CollectionResult {
     })
 }
 
-/// 构造数据源不可用时的 Unhealthy 失败结果。
-#[allow(dead_code)]
-fn source_unavailable(source: &'static str, message: &str) -> CollectionResult {
-    Err(source_failure(source, message))
-}
-
 fn source_failure(source: &'static str, message: impl Into<String>) -> Box<CollectorFailure> {
     let error = CollectorError::SourceUnavailable {
         source,
@@ -503,21 +497,6 @@ impl TcEbpfCollector {
             u32::from_be(key.destination_ip),
             u16::from_be(key.destination_port),
         )
-    }
-}
-
-#[allow(dead_code)]
-pub struct DnsAttributionCollector;
-
-impl FlowCollector for DnsAttributionCollector {
-    /// 返回 DNS 归因数据源名称。
-    fn source_name(&self) -> &'static str {
-        "dns-attribution"
-    }
-
-    /// DNS 归因采集占位（尚未实现）。
-    fn collect(&self) -> CollectionResult {
-        source_unavailable(self.source_name(), "collector is not implemented")
     }
 }
 
