@@ -8,11 +8,17 @@ Linux 软路由流量观测与统计工具。
 以及可选的模拟采集闭环。第一版 TC eBPF 采集器已经接入，可在 Linux namespace
 拓扑中采集 LAN ingress/egress 上的 IPv4 TCP/UDP 双向 Flow，并可选通过只读
 conntrack netlink 快照补齐 NAT 关联；可选的本地 DNS UDP/TCP 转发与 IPv4 域名归因
-已经接入，本地账户认证仍在后续阶段。
+已经接入，本地管理员账户认证、会话和 CSRF 防护也已经接入。
 
 - `GET /healthz` 可用于健康检查；
-- `/login` 是公开的登录页面骨架；
-- 设置 `ROUTESCOPE_DEV_BYPASS_AUTH=1` 后可在本地联调 `/api/v1/*` 只读接口；
+- `/login` 是公开的登录页面，管理页和 `/api/v1/*` 需要有效会话；
+- 设置 `ROUTESCOPE_DEV_BYPASS_AUTH=1` 后，仅当监听地址是 loopback 时可在本地联调
+  `/api/v1/*` 只读接口；
+- 首次部署时设置 `ROUTESCOPE_ADMIN_USERNAME` 和 Argon2id PHC 格式的
+  `ROUTESCOPE_ADMIN_PASSWORD_HASH`；首个启动会将账户哈希写入 SQLite，后续启动从本地库读取；
+- 可用 `printf '%s\n' 'your-password' | cargo run --quiet -- hash-password` 生成密码哈希；
+- 通过 HTTPS 反向代理访问时设置 `ROUTESCOPE_SECURE_COOKIES=1`，会话 Cookie 同时启用
+  `HttpOnly`、`SameSite=Lax`；
 - 设置 `ROUTESCOPE_ENABLE_SIMULATOR=1` 后，服务会周期性写入可重复的测试 Flow；
 - 设置 `ROUTESCOPE_ENABLE_TC_EBPF=1` 后可启用 TC eBPF 采集器；
 - 设置 `ROUTESCOPE_ENABLE_CONNTRACK=1` 后可在 TC eBPF Flow 上启用 conntrack NAT 关联；
@@ -21,7 +27,8 @@ conntrack netlink 快照补齐 NAT 关联；可选的本地 DNS UDP/TCP 转发�
   请求重定向到该端口；
 - TC eBPF 需要 root、clang、BPF-capable Linux 内核，并且只能在已准备好的路由
   namespace 或真实软路由上启用；
-- 正式认证尚未实现，生产环境不得开启开发绕过。
+- 生产环境不得开启开发绕过；服务本身默认使用 HTTP，生产部署应限制监听网段并在前置
+  HTTPS 终止后启用安全 Cookie。
 
 ## 开发
 
@@ -32,7 +39,8 @@ cp .env.example .env
 make run
 ```
 
-默认地址为 `http://127.0.0.1:8080`。在实现本地账户认证前，请勿将监听地址改为 LAN 或 WAN 可访问的地址。
+默认地址为 `http://127.0.0.1:8080`。默认配置中的开发绕过只对 loopback 地址生效；
+生产环境应配置管理员密码哈希并关闭绕过。
 模拟采集默认关闭；需要联调时将 `.env` 中的
 `ROUTESCOPE_ENABLE_SIMULATOR` 改为 `1`。
 
@@ -62,7 +70,7 @@ eBPF 双向 Flow 能按客户端 MAC 出现在 API 中，并在启用 conntrack 
 
 ```text
 src/api/       HTTP API 路由
-src/auth.rs    管理认证边界（TODO）
+src/auth.rs    本地账户、Argon2id、会话、CSRF 与限速
 src/collector.rs TC eBPF、采集管线与模拟采集器
 src/conntrack.rs conntrack netlink 快照与 NAT 关联
 src/dns.rs     DNS observation 队列、TTL 缓存与 Flow 域名归因

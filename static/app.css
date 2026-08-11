@@ -26,7 +26,8 @@ main {
 }
 
 .brand { color: #7dd3fc; font-weight: 700; text-decoration: none; }
-nav a { color: #cbd5e1; margin-left: 1rem; text-decoration: none; }
+nav { display: flex; align-items: center; gap: 1rem; }
+nav a { color: #cbd5e1; text-decoration: none; }
 .eyebrow { color: #7dd3fc; font-size: .8rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .empty-state,
 .auth-card { background: #17243a; border: 1px solid #293a55; border-radius: .75rem; padding: 1.5rem; }
@@ -35,4 +36,12 @@ nav a { color: #cbd5e1; margin-left: 1rem; text-decoration: none; }
 form { display: grid; gap: 1rem; margin-top: 1.5rem; }
 label { display: grid; gap: .35rem; }
 input, button { border-radius: .4rem; padding: .65rem; }
-button { cursor: not-allowed; }
+button { cursor: pointer; }
+.error { color: #fda4af; }
+.logout-form { display: inline; margin: 0; }
+.logout-form button {
+  color: #cbd5e1;
+  background: transparent;
+  border: 0;
+  padding: 0;
+}

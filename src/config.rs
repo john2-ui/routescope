@@ -7,6 +7,9 @@ pub struct Config {
     pub flow_retention_hours: u32,
     pub aggregate_retention_days: u32,
     pub dev_bypass_auth: bool,
+    pub admin_username: String,
+    pub admin_password_hash: Option<String>,
+    pub secure_cookies: bool,
     pub simulator_enabled: bool,
     pub simulator_interval_secs: u64,
     pub tc_ebpf_enabled: bool,
@@ -28,6 +31,9 @@ impl Config {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(|| "127.0.0.1:8080".parse().expect("valid default address"));
+        let dev_bypass_requested = std::env::var("ROUTESCOPE_DEV_BYPASS_AUTH")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         Self {
             listen_addr,
@@ -35,8 +41,15 @@ impl Config {
                 .unwrap_or_else(|_| "data/routescope.db".to_owned()),
             flow_retention_hours: 24,
             aggregate_retention_days: 30,
-            dev_bypass_auth: std::env::var("ROUTESCOPE_DEV_BYPASS_AUTH")
-                .map(|value| value == "1")
+            // The bypass is deliberately ignored for LAN/WAN listeners.
+            dev_bypass_auth: dev_bypass_requested && listen_addr.ip().is_loopback(),
+            admin_username: std::env::var("ROUTESCOPE_ADMIN_USERNAME")
+                .unwrap_or_else(|_| "admin".to_owned()),
+            admin_password_hash: std::env::var("ROUTESCOPE_ADMIN_PASSWORD_HASH")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            secure_cookies: std::env::var("ROUTESCOPE_SECURE_COOKIES")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             simulator_enabled: std::env::var("ROUTESCOPE_ENABLE_SIMULATOR")
                 .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))

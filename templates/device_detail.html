@@ -9,7 +9,13 @@
 <body>
   <header class="header">
     <a class="brand" href="/">RouteScope</a>
-    <nav><a href="/">概览</a><a href="/devices">设备</a></nav>
+    <nav>
+      <a href="/">概览</a><a href="/devices">设备</a>
+      <form method="post" action="/logout" class="logout-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">退出</button>
+      </form>
+    </nav>
   </header>
   <main>
     <p class="eyebrow">设备详情</p>

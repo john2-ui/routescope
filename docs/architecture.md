@@ -346,7 +346,8 @@ TC eBPF + conntrack + 用户态聚合
 
 当前代码已实现领域模型、SQLite 持久化、分钟聚合、只读 API、可选模拟采集，
 第一版 TC eBPF IPv4 TCP/UDP 双向 Flow 统计、只读 conntrack NAT 关联，以及可选
-的本地 DNS UDP/TCP 转发和 IPv4 A 记录域名归因；本地账户认证仍在后续阶段。
+的本地 DNS UDP/TCP 转发和 IPv4 A 记录域名归因；本地管理员账户认证、会话和 CSRF
+防护也已落地。
 
 ```text
 .
@@ -363,7 +364,7 @@ TC eBPF + conntrack + 用户态聚合
 │   ├── main.rs                 # 服务启动、路由组装和路由测试
 │   ├── api/
 │   │   └── mod.rs              # 健康检查与受保护的只读 API 路由
-│   ├── auth.rs                 # 管理认证边界（TODO）
+│   ├── auth.rs                 # 本地账户、Argon2id、会话、CSRF 与限速
 │   ├── collector.rs            # 真实采集接口与模拟采集器
 │   ├── conntrack.rs            # conntrack netlink 快照与 NAT 关联
 │   ├── dns.rs                  # DNS observation 队列、TTL 缓存与 Flow 域名归因
@@ -378,7 +379,7 @@ TC eBPF + conntrack + 用户态聚合
 ├── scripts/
 │   └── namespace_lab.sh        # namespace 拓扑与 NAT smoke test
 ├── templates/
-│   ├── login.html              # 登录页面骨架
+│   ├── login.html              # 登录页面
 │   ├── dashboard.html          # 仪表盘空状态
 │   ├── devices.html            # 设备列表空状态
 │   └── device_detail.html      # 设备详情空状态
@@ -386,4 +387,6 @@ TC eBPF + conntrack + 用户态聚合
     └── app.css                 # 最小管理界面样式
 ```
 
-服务默认仅监听 `127.0.0.1:8080`。`/healthz` 可用于健康检查；认证完成前，管理页面和 `/api/v1/*` 均由认证中间件拒绝访问。
+服务默认仅监听 `127.0.0.1:8080`。`/healthz` 可用于健康检查；管理页面和
+`/api/v1/*` 均由本地会话认证中间件保护，登录 POST/登出 POST 均要求 CSRF 校验。
+开发绕过只接受 loopback 监听地址。

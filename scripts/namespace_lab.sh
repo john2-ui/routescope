@@ -308,7 +308,7 @@ start_routescope_collector() {
     rm -f "$ROUTESCOPE_DB"
 
     ns_exec "$ROUTER_NS" env \
-        ROUTESCOPE_LISTEN_ADDR=10.0.0.1:8080 \
+        ROUTESCOPE_LISTEN_ADDR=127.0.0.1:8080 \
         ROUTESCOPE_DATABASE_PATH="$ROUTESCOPE_DB" \
         ROUTESCOPE_DEV_BYPASS_AUTH=1 \
         ROUTESCOPE_ENABLE_SIMULATOR=0 \
@@ -325,7 +325,7 @@ start_routescope_collector() {
     for _ in {1..50}; do
         if ns_exec "$ROUTER_NS" curl \
             --fail --silent --max-time 1 \
-            "http://${LAN_ROUTER_IP}:8080/healthz" >/dev/null; then
+            "http://127.0.0.1:8080/healthz" >/dev/null; then
             return 0
         fi
 
@@ -408,7 +408,7 @@ test_collector_api() {
     for _ in {1..30}; do
         devices_json=$(ns_exec "$ROUTER_NS" curl \
             --fail --silent --max-time 1 \
-            "http://${LAN_ROUTER_IP}:8080/api/v1/devices") || true
+            "http://127.0.0.1:8080/api/v1/devices") || true
         if [[ -n "$devices_json" ]] && assert_collector_devices "$devices_json" >/dev/null 2>&1; then
             break
         fi
@@ -424,10 +424,10 @@ test_collector_api() {
     for _ in {1..30}; do
         laptop_flows=$(ns_exec "$ROUTER_NS" curl \
             --fail --silent --max-time 1 \
-            "http://${LAN_ROUTER_IP}:8080/api/v1/devices/${CLIENT_A_MAC}/flows") || true
+            "http://127.0.0.1:8080/api/v1/devices/${CLIENT_A_MAC}/flows") || true
         phone_flows=$(ns_exec "$ROUTER_NS" curl \
             --fail --silent --max-time 1 \
-            "http://${LAN_ROUTER_IP}:8080/api/v1/devices/${CLIENT_B_MAC}/flows") || true
+            "http://127.0.0.1:8080/api/v1/devices/${CLIENT_B_MAC}/flows") || true
 
         if [[ -n "$laptop_flows" ]] \
             && [[ -n "$phone_flows" ]] \

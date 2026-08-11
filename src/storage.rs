@@ -132,9 +132,48 @@ impl SqliteRepository {
                 ON device_minute_stats(minute_ms);
             CREATE INDEX IF NOT EXISTS idx_domain_minute_stats_minute
                 ON domain_minute_stats(minute_ms);
+            CREATE TABLE IF NOT EXISTS local_accounts (
+                username      TEXT PRIMARY KEY NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
             "#,
         )?;
         Ok(())
+    }
+
+    /// 返回最早创建的本地管理账户；首版只使用一个管理员账户。
+    pub fn first_local_account(&self) -> SqliteResult<Option<(String, String)>> {
+        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+        conn.query_row(
+            r#"
+            SELECT username, password_hash
+            FROM local_accounts
+            ORDER BY created_at_ms ASC, username ASC
+            LIMIT 1
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+    }
+
+    /// 在尚未配置本地账户时写入首个管理员账户。
+    pub fn insert_local_account_if_missing(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> SqliteResult<bool> {
+        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+        let inserted = conn.execute(
+            r#"
+            INSERT INTO local_accounts (username, password_hash, created_at_ms)
+            VALUES (?1, ?2, strftime('%s','now') * 1000)
+            ON CONFLICT(username) DO NOTHING
+            "#,
+            params![username, password_hash],
+        )?;
+        Ok(inserted == 1)
     }
 }
 
