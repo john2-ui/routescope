@@ -41,9 +41,9 @@ impl CollectorHealthTracker {
                     } else {
                         "disabled".to_owned()
                     },
-                    // The source has been constructed successfully before the
-                    // HTTP listener starts; runtime failures flip this false.
-                    ready: true,
+                    // Enabled collectors stay not-ready until the first successful
+                    // batch; disabled collectors have nothing to wait for.
+                    ready: !enabled,
                     observed_at_ms: None,
                     last_success_at_ms: None,
                     flows_seen: 0,
@@ -110,4 +110,46 @@ pub struct AppState {
     pub collector_health: Arc<CollectorHealthTracker>,
     pub dev_bypass_auth: bool,
     pub secure_cookies: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collector::{CollectorHealth, CollectorHealthState};
+
+    #[test]
+    fn enabled_collector_starts_not_ready() {
+        let tracker = CollectorHealthTracker::new(Some("tc_ebpf"));
+        let snapshot = tracker.snapshot();
+        assert!(snapshot.enabled);
+        assert_eq!(snapshot.state, "starting");
+        assert!(!snapshot.ready);
+    }
+
+    #[test]
+    fn disabled_collector_is_immediately_ready() {
+        let tracker = CollectorHealthTracker::new(None);
+        let snapshot = tracker.snapshot();
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.state, "disabled");
+        assert!(snapshot.ready);
+    }
+
+    #[test]
+    fn first_successful_batch_marks_ready() {
+        let tracker = CollectorHealthTracker::new(Some("simulated"));
+        tracker.record_batch(
+            &CollectorHealth {
+                state: CollectorHealthState::Healthy,
+                observed_at_ms: 1_000,
+                flows_seen: 2,
+                flows_emitted: 2,
+                last_error: None,
+            },
+            Ok(2),
+        );
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.state, "healthy");
+        assert!(snapshot.ready);
+    }
 }
