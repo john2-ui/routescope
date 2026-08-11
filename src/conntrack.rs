@@ -1,4 +1,4 @@
- //! Read-only conntrack snapshots and LAN Flow enrichment.
+//! Read-only conntrack snapshots and LAN Flow enrichment.
 
 use crate::domain::{ConnectionState, Flow};
 use conntrack::{

@@ -161,7 +161,7 @@ impl fmt::Display for CollectorFailure {
 
 impl std::error::Error for CollectorFailure {}
 
-pub type CollectionResult = Result<CollectionBatch, CollectorFailure>;
+pub type CollectionResult = Result<CollectionBatch, Box<CollectorFailure>>;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -257,10 +257,10 @@ fn validate_batch(source: &'static str, flows: Vec<Flow>) -> CollectionResult {
                 flow_id: flow.flow_id.clone(),
             };
 
-            return Err(CollectorFailure {
+            return Err(Box::new(CollectorFailure {
                 health: CollectorHealth::degraded(observed_at_ms, flows_seen, &error),
                 error,
-            });
+            }));
         }
 
         if let Err(reason) = flow.validate() {
@@ -270,10 +270,10 @@ fn validate_batch(source: &'static str, flows: Vec<Flow>) -> CollectionResult {
                 reason: reason.to_owned(),
             };
 
-            return Err(CollectorFailure {
+            return Err(Box::new(CollectorFailure {
                 health: CollectorHealth::degraded(observed_at_ms, flows_seen, &error),
                 error,
-            });
+            }));
         }
     }
 
@@ -290,16 +290,16 @@ fn source_unavailable(source: &'static str, message: &str) -> CollectionResult {
     Err(source_failure(source, message))
 }
 
-fn source_failure(source: &'static str, message: impl Into<String>) -> CollectorFailure {
+fn source_failure(source: &'static str, message: impl Into<String>) -> Box<CollectorFailure> {
     let error = CollectorError::SourceUnavailable {
         source,
         message: message.into(),
     };
 
-    CollectorFailure {
+    Box::new(CollectorFailure {
         health: CollectorHealth::unhealthy(now_ms(), &error),
         error,
-    }
+    })
 }
 
 pub struct TcEbpfCollector {
@@ -372,7 +372,7 @@ impl TcEbpfCollector {
     pub fn new(
         lan_interface: impl Into<String>,
         wan_interface: impl Into<String>,
-    ) -> Result<Self, CollectorFailure> {
+    ) -> Result<Self, Box<CollectorFailure>> {
         let lan_interface = lan_interface.into();
         let wan_interface = wan_interface.into();
 
