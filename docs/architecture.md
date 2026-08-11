@@ -123,7 +123,7 @@ flowchart LR
             DOMAIN_JOIN["域名关联器<br/>按 client + target IP + TTL<br/>记录 domain_source / confidence"]
             REALTIME["实时统计视图<br/>设备 / Flow / 域名 Top"]
             SQLITE["SQLite 持久化<br/>Flow 连接明细：24h<br/>设备 / 域名分钟聚合：30d"]
-            API["只读 API / Web UI<br/>设备、Flow、域名 Top 查询"]
+            API["观测只读 API / Web UI<br/>设备、Flow、域名 Top 查询<br/>设备名称管理"]
 
             BPF_MAPS --> EVENT_PIPE --> COLLECTOR
             CT_EXPORT --> COLLECTOR
@@ -344,7 +344,7 @@ TC eBPF + conntrack + 用户态聚合
 
 ## 11. 当前项目文件结构
 
-当前代码已实现领域模型、SQLite 持久化、分钟聚合、只读 API、可选模拟采集，
+当前代码已实现领域模型、SQLite 持久化、分钟聚合、观测只读 API、设备名称管理和可选模拟采集，
 第一版 TC eBPF IPv4 TCP/UDP 双向 Flow 统计、只读 conntrack NAT 关联，以及可选
 的本地 DNS UDP/TCP 转发和 IPv4 A 记录域名归因；本地管理员账户认证、会话和 CSRF
 防护也已落地。
@@ -375,18 +375,27 @@ TC eBPF + conntrack + 用户态聚合
 │   ├── domain.rs               # Device、Flow、域名归因领域模型
 │   ├── service.rs              # 观测查询、Flow 写入与清理
 │   ├── storage.rs              # SQLite 仓储、聚合与清理
-│   └── web.rs                  # 服务端渲染页面和静态资源路由
+│   └── web.rs                  # 真实观测页面、设备命名和静态资源路由
 ├── scripts/
 │   └── namespace_lab.sh        # namespace 拓扑与 NAT smoke test
 ├── templates/
 │   ├── login.html              # 登录页面
-│   ├── dashboard.html          # 仪表盘空状态
-│   ├── devices.html            # 设备列表空状态
-│   └── device_detail.html      # 设备详情空状态
+│   ├── dashboard.html          # 设备概览与实时统计
+│   ├── devices.html            # 设备列表与手动命名
+│   └── device_detail.html      # Flow、趋势与域名 Top
 └── static/
     └── app.css                 # 最小管理界面样式
 ```
 
-服务默认仅监听 `127.0.0.1:8080`。`/healthz` 可用于健康检查；管理页面和
-`/api/v1/*` 均由本地会话认证中间件保护，登录 POST/登出 POST 均要求 CSRF 校验。
-开发绕过只接受 loopback 监听地址。
+服务默认仅监听 `127.0.0.1:8080`。`/healthz` 是进程存活检查，`/readyz` 会反映已启用
+采集器是否已完成启动；运行中的采集失败会让就绪状态降级。管理页面和 `/api/v1/*` 均由本地会话认证中间件保护，
+登录 POST/登出 POST/设备命名 POST 均要求 CSRF 校验。开发绕过只接受 loopback 监听地址。
+
+SQLite 使用 `PRAGMA user_version` 记录 schema 版本。打开数据库时会在事务中执行尚未
+应用的迁移，并启用 WAL、忙等待与 `synchronous=NORMAL`；Flow 批次使用单事务写入，
+避免每条 Flow 单独获取锁和提交。
+
+收到 SIGINT/SIGTERM 后，HTTP 服务进入优雅退出，采集、DNS 归因和保留期清理任务通过
+共享 shutdown 信号停止。`ROUTESCOPE_SHUTDOWN_TIMEOUT_SECS` 控制等待 HTTP 连接的最长
+时间。eBPF 构建默认根据 Cargo target 选择 `__TARGET_ARCH_*`，也可通过
+`ROUTESCOPE_BPF_TARGET_ARCH` 显式覆盖。

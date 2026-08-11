@@ -4,13 +4,14 @@ Linux 软路由流量观测与统计工具。
 
 ## 当前状态
 
-项目目前是可启动的 Rust 服务，已实现领域模型、SQLite 存储、分钟聚合、只读 API
-以及可选的模拟采集闭环。第一版 TC eBPF 采集器已经接入，可在 Linux namespace
+项目目前是可启动的 Rust 服务，已实现领域模型、SQLite 存储、分钟聚合、观测 API、
+设备名称管理以及可选的模拟采集闭环。第一版 TC eBPF 采集器已经接入，可在 Linux namespace
 拓扑中采集 LAN ingress/egress 上的 IPv4 TCP/UDP 双向 Flow，并可选通过只读
 conntrack netlink 快照补齐 NAT 关联；可选的本地 DNS UDP/TCP 转发与 IPv4 域名归因
 已经接入，本地管理员账户认证、会话和 CSRF 防护也已经接入。
 
 - `GET /healthz` 可用于健康检查；
+- `GET /readyz` 用于判断存储和已启用采集器是否已完成启动；
 - `/login` 是公开的登录页面，管理页和 `/api/v1/*` 需要有效会话；
 - 设置 `ROUTESCOPE_DEV_BYPASS_AUTH=1` 后，仅当监听地址是 loopback 时可在本地联调
   `/api/v1/*` 只读接口；
@@ -29,6 +30,13 @@ conntrack netlink 快照补齐 NAT 关联；可选的本地 DNS UDP/TCP 转发�
   namespace 或真实软路由上启用；
 - 生产环境不得开启开发绕过；服务本身默认使用 HTTP，生产部署应限制监听网段并在前置
   HTTPS 终止后启用安全 Cookie。
+- `/`、`/devices` 和 `/devices/<mac>` 已接入 SQLite 中的设备、Flow、分钟趋势与域名
+  Top 数据；设备列表支持手动命名，管理 API 为
+  `POST /api/v1/devices/<mac>/name`（需要 `X-CSRF-Token`）。
+- SQLite 使用 `PRAGMA user_version` 执行 schema 迁移，Flow 批次在单事务中写入；可用
+  `make benchmark` 或 `cargo run --release -- benchmark-storage 10000` 做离线写入基准。
+- 收到 SIGINT/SIGTERM 后会停止采集、DNS、清理后台任务并等待 HTTP 连接，超时由
+  `ROUTESCOPE_SHUTDOWN_TIMEOUT_SECS` 控制。
 
 ## 开发
 
@@ -50,7 +58,13 @@ make run
 make fmt
 make check
 make test
+make clippy
+make benchmark
 ```
+
+跨架构编译 eBPF 对象时，`build.rs` 默认从 Cargo target 推导架构，也可显式设置
+`ROUTESCOPE_BPF_TARGET_ARCH=arm64` 等值；clang 路径仍可通过
+`ROUTESCOPE_CLANG` 覆盖。
 
 Linux namespace 集成环境（需要 root、`iproute2`、`nftables`、`curl` 和 Python 3）：
 

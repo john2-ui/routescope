@@ -14,7 +14,7 @@ body {
 
 .header,
 main {
-  max-width: 960px;
+  max-width: 1280px;
   margin: 0 auto;
   padding: 1.25rem 2rem;
 }
@@ -28,15 +28,19 @@ main {
 .brand { color: #7dd3fc; font-weight: 700; text-decoration: none; }
 nav { display: flex; align-items: center; gap: 1rem; }
 nav a { color: #cbd5e1; text-decoration: none; }
+.muted, small { color: #91a4bf; }
+.status-line { color: #cbd5e1; }
 .eyebrow { color: #7dd3fc; font-size: .8rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .empty-state,
-.auth-card { background: #17243a; border: 1px solid #293a55; border-radius: .75rem; padding: 1.5rem; }
+.auth-card,
+.panel { background: #17243a; border: 1px solid #293a55; border-radius: .75rem; padding: 1.5rem; }
 .auth-page { display: grid; place-items: center; padding: 1.5rem; }
 .auth-card { max-width: 420px; width: 100%; }
 form { display: grid; gap: 1rem; margin-top: 1.5rem; }
 label { display: grid; gap: .35rem; }
-input, button { border-radius: .4rem; padding: .65rem; }
-button { cursor: pointer; }
+input, button { border: 1px solid #3c5270; border-radius: .4rem; padding: .65rem; }
+input { color: #e7edf7; background: #0e1726; min-width: 0; }
+button { color: #07111e; background: #7dd3fc; cursor: pointer; font-weight: 700; }
 .error { color: #fda4af; }
 .logout-form { display: inline; margin: 0; }
 .logout-form button {
@@ -44,4 +48,87 @@ button { cursor: pointer; }
   background: transparent;
   border: 0;
   padding: 0;
+}
+
+h1 { margin-bottom: .5rem; }
+h2 { margin: 0; }
+a { color: #7dd3fc; }
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+.metric-card {
+  background: #17243a;
+  border: 1px solid #293a55;
+  border-radius: .75rem;
+  padding: 1rem 1.25rem;
+}
+.metric-card span { color: #91a4bf; display: block; font-size: .85rem; }
+.metric-card strong { display: block; font-size: 1.45rem; margin-top: .35rem; }
+.section-heading,
+.detail-heading {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.detail-heading { align-items: flex-start; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; min-width: 900px; width: 100%; }
+th, td { border-bottom: 1px solid #293a55; padding: .8rem .65rem; text-align: left; vertical-align: top; }
+th { color: #91a4bf; font-size: .78rem; letter-spacing: .04em; text-transform: uppercase; }
+td small { display: block; margin-top: .25rem; }
+.traffic-up { color: #86efac; }
+.traffic-down { color: #fda4af; }
+.inline-form {
+  align-items: center;
+  display: flex;
+  gap: .4rem;
+  margin: 0;
+  min-width: 260px;
+}
+.inline-form input { flex: 1; }
+.inline-form button { padding: .65rem .8rem; }
+.badge {
+  background: #334155;
+  border-radius: 999px;
+  display: inline-block;
+  font-size: .75rem;
+  padding: .2rem .55rem;
+}
+.badge-healthy, .badge-high { background: #14532d; color: #bbf7d0; }
+.badge-degraded, .badge-low { background: #713f12; color: #fef08a; }
+.badge-unhealthy { background: #7f1d1d; color: #fecaca; }
+.badge-starting { background: #164e63; color: #a5f3fc; }
+.badge-disabled, .badge-unknown { background: #334155; color: #cbd5e1; }
+.traffic-chart { display: grid; gap: .45rem; }
+.traffic-row {
+  align-items: center;
+  display: grid;
+  gap: .6rem;
+  grid-template-columns: 145px minmax(100px, 1fr) 80px 150px;
+  font-size: .82rem;
+}
+.traffic-row time { color: #91a4bf; overflow: hidden; text-overflow: ellipsis; }
+.bar-track { background: #0e1726; border-radius: 999px; height: .55rem; overflow: hidden; }
+.bar-fill { background: linear-gradient(90deg, #38bdf8, #818cf8); height: 100%; }
+.empty-inline { color: #91a4bf; margin: 0; }
+.sr-only {
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  position: absolute;
+  width: 1px;
+  clip: rect(0, 0, 0, 0);
+}
+
+@media (max-width: 800px) {
+  .header, main { padding-left: 1rem; padding-right: 1rem; }
+  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .section-heading, .detail-heading { align-items: flex-start; flex-direction: column; }
+  .traffic-row { grid-template-columns: 115px minmax(80px, 1fr) 65px; }
+  .traffic-row small { display: none; }
 }

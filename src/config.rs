@@ -6,6 +6,7 @@ pub struct Config {
     pub database_path: String,
     pub flow_retention_hours: u32,
     pub aggregate_retention_days: u32,
+    pub shutdown_timeout_secs: u64,
     pub dev_bypass_auth: bool,
     pub admin_username: String,
     pub admin_password_hash: Option<String>,
@@ -39,8 +40,9 @@ impl Config {
             listen_addr,
             database_path: std::env::var("ROUTESCOPE_DATABASE_PATH")
                 .unwrap_or_else(|_| "data/routescope.db".to_owned()),
-            flow_retention_hours: 24,
-            aggregate_retention_days: 30,
+            flow_retention_hours: env_u32("ROUTESCOPE_FLOW_RETENTION_HOURS", 24),
+            aggregate_retention_days: env_u32("ROUTESCOPE_AGGREGATE_RETENTION_DAYS", 30),
+            shutdown_timeout_secs: env_u64("ROUTESCOPE_SHUTDOWN_TIMEOUT_SECS", 10),
             // The bypass is deliberately ignored for LAN/WAN listeners.
             dev_bypass_auth: dev_bypass_requested && listen_addr.ip().is_loopback(),
             admin_username: std::env::var("ROUTESCOPE_ADMIN_USERNAME")
@@ -99,4 +101,20 @@ impl Config {
                 .unwrap_or(2_000),
         }
     }
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }

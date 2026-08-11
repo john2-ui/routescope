@@ -20,10 +20,45 @@
   <main>
     <p class="eyebrow">网络流量观测</p>
     <h1>概览</h1>
+    <p class="status-line">采集器状态：<span class="badge badge-{{ collector_status }}">{{ collector_status }}</span></p>
+    <section class="metric-grid">
+      <article class="metric-card"><span>设备</span><strong>{{ device_count }}</strong></article>
+      <article class="metric-card"><span>最近流量上行</span><strong>{{ total_upload }}</strong></article>
+      <article class="metric-card"><span>最近流量下行</span><strong>{{ total_download }}</strong></article>
+      <article class="metric-card"><span>最近连接</span><strong>{{ active_flow_count }}</strong></article>
+    </section>
+    {% if devices.is_empty() %}
     <section class="empty-state">
       <h2>尚无采集数据</h2>
-      <p>TODO: 连接 TC eBPF、conntrack、DNS 归因与 SQLite 存储后，在此显示实时设备流量和历史趋势。</p>
+      <p>启动模拟采集器或 TC eBPF 采集器后，设备流量会自动出现在这里。</p>
     </section>
+    {% else %}
+    <section class="panel">
+      <div class="section-heading">
+        <h2>设备实时概览</h2>
+        <a href="/devices">查看全部设备</a>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>设备</th><th>当前 IP</th><th>连接</th><th>上下行</th><th>域名 Top</th><th>最近观测</th></tr>
+          </thead>
+          <tbody>
+          {% for device in devices %}
+            <tr>
+              <td><a href="/devices/{{ device.mac_address }}"><strong>{{ device.display_name }}</strong></a><small>{{ device.mac_address }}</small></td>
+              <td>{{ device.current_ip }}</td>
+              <td>{{ device.flow_count }}</td>
+              <td><span class="traffic-up">{{ device.upload_bytes }}</span><br><span class="traffic-down">{{ device.download_bytes }}</span></td>
+              <td>{{ device.top_domain }}<small>{{ device.top_domain_meta }}</small></td>
+              <td>{{ device.last_seen }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    {% endif %}
   </main>
 </body>
 </html>

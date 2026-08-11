@@ -19,10 +19,85 @@
   </header>
   <main>
     <p class="eyebrow">设备详情</p>
-    <h1>尚未选择设备</h1>
-    <section class="empty-state">
-      <h2>暂无连接与域名数据</h2>
-      <p>TODO: 显示最近 24 小时 Flow 明细，以及按流量排序并标注置信度的域名 Top。</p>
+    <p><a href="/devices">← 返回设备列表</a></p>
+    <div class="detail-heading">
+      <div>
+        <h1>{{ device.display_name }}</h1>
+        <p class="muted">{{ device.mac_address }} · {{ device.current_ip }}</p>
+      </div>
+      <span class="badge badge-{{ collector_status }}">采集器 {{ collector_status }}</span>
+    </div>
+    <section class="metric-grid">
+      <article class="metric-card"><span>最近连接</span><strong>{{ device.flow_count }}</strong></article>
+      <article class="metric-card"><span>总流量</span><strong>{{ device.total_bytes }}</strong></article>
+      <article class="metric-card"><span>上行</span><strong>{{ device.upload_bytes }}</strong></article>
+      <article class="metric-card"><span>下行</span><strong>{{ device.download_bytes }}</strong></article>
+    </section>
+    <section class="panel">
+      <div class="section-heading"><h2>最近 24 小时分钟趋势</h2><span class="muted">最多显示最近 180 个桶</span></div>
+      {% if traffic.is_empty() %}
+      <p class="empty-inline">暂无分钟聚合数据。</p>
+      {% else %}
+      <div class="traffic-chart">
+      {% for point in traffic %}
+        <div class="traffic-row">
+          <time>{{ point.minute }}</time>
+          <div class="bar-track"><div class="bar-fill" style="width: {{ point.bar_width }}%"></div></div>
+          <span>{{ point.total_bytes }}</span>
+          <small><span class="traffic-up">{{ point.upload_bytes }}</span> / <span class="traffic-down">{{ point.download_bytes }}</span></small>
+        </div>
+      {% endfor %}
+      </div>
+      {% endif %}
+    </section>
+    <section class="panel">
+      <div class="section-heading"><h2>域名 Top</h2><span class="muted">来源 / 置信度</span></div>
+      {% if domains.is_empty() %}
+      <p class="empty-inline">没有可靠的域名归因；未知连接不会被猜测成域名。</p>
+      {% else %}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>域名</th><th>总流量</th><th>上行</th><th>下行</th><th>来源</th><th>置信度</th></tr></thead>
+          <tbody>
+          {% for domain in domains %}
+            <tr>
+              <td><strong>{{ domain.domain }}</strong></td>
+              <td>{{ domain.total_bytes }}</td>
+              <td>{{ domain.upload_bytes }}</td>
+              <td>{{ domain.download_bytes }}</td>
+              <td>{{ domain.source }}</td>
+              <td><span class="badge badge-{{ domain.confidence }}">{{ domain.confidence }}</span></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </section>
+    <section class="panel">
+      <div class="section-heading"><h2>最近 24 小时 Flow</h2><span class="muted">客户端视角：上行 / 下行</span></div>
+      {% if flows.is_empty() %}
+      <p class="empty-inline">暂无连接数据。</p>
+      {% else %}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>最近观测</th><th>协议 / 状态</th><th>客户端</th><th>目标</th><th>NAT 映射</th><th>流量</th><th>域名</th></tr></thead>
+          <tbody>
+          {% for flow in flows %}
+            <tr>
+              <td>{{ flow.last_seen }}</td>
+              <td>{{ flow.protocol }}<small>{{ flow.connection_state }}</small></td>
+              <td>{{ flow.client_endpoint }}</td>
+              <td>{{ flow.destination_endpoint }}</td>
+              <td><small>{{ flow.nat_mapping }}</small></td>
+              <td><span class="traffic-up">{{ flow.upload_bytes }}</span><br><span class="traffic-down">{{ flow.download_bytes }}</span><small>{{ flow.packet_count }} packets</small></td>
+              <td>{{ flow.domain }}<small>{{ flow.source }} / {{ flow.confidence }}</small></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
     </section>
   </main>
 </body>

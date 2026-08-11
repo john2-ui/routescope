@@ -335,6 +335,25 @@ pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         })
 }
 
+/// Validate a CSRF token for a browser form or management API request.
+pub(crate) fn csrf_request_is_valid(
+    state: &AppState,
+    headers: &HeaderMap,
+    submitted_token: &str,
+) -> bool {
+    if submitted_token.is_empty() {
+        return false;
+    }
+
+    if state.dev_bypass_auth {
+        return cookie_value(headers, CSRF_COOKIE_NAME).as_deref() == Some(submitted_token);
+    }
+
+    cookie_value(headers, SESSION_COOKIE_NAME)
+        .as_deref()
+        .is_some_and(|session| state.auth.is_csrf_valid(session, submitted_token))
+}
+
 /// Adds a Set-Cookie header with the attributes used by management cookies.
 pub(crate) fn append_cookie(
     response: &mut Response,

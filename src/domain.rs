@@ -16,6 +16,16 @@ pub struct Device {
     pub current_ip: Option<String>,
 }
 
+/// Normalize a user-provided device name; an empty value clears the name.
+pub fn normalize_display_name(value: Option<&str>) -> Result<Option<String>, &'static str> {
+    let value = value.unwrap_or("").trim();
+    if value.len() > 128 || value.chars().any(char::is_control) {
+        return Err("display name must be at most 128 non-control characters");
+    }
+
+    Ok((!value.is_empty()).then(|| value.to_owned()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Flow {
     pub flow_id: String,
@@ -390,5 +400,15 @@ mod tests {
     fn floor_to_minute_aligns_to_bucket_start() {
         assert_eq!(floor_to_minute_ms(61_234), 60_000);
         assert_eq!(floor_to_minute_ms(60_000), 60_000);
+    }
+
+    #[test]
+    fn display_name_normalization_trims_and_allows_clearing() {
+        assert_eq!(
+            normalize_display_name(Some("  Living Room TV  ")).unwrap(),
+            Some("Living Room TV".to_owned())
+        );
+        assert_eq!(normalize_display_name(Some("   ")).unwrap(), None);
+        assert!(normalize_display_name(Some("bad\nname")).is_err());
     }
 }

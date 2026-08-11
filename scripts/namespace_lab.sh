@@ -325,7 +325,10 @@ start_routescope_collector() {
     for _ in {1..50}; do
         if ns_exec "$ROUTER_NS" curl \
             --fail --silent --max-time 1 \
-            "http://127.0.0.1:8080/healthz" >/dev/null; then
+            "http://127.0.0.1:8080/healthz" >/dev/null \
+            && ns_exec "$ROUTER_NS" curl \
+                --fail --silent --max-time 1 \
+                "http://127.0.0.1:8080/readyz" >/dev/null; then
             return 0
         fi
 

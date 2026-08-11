@@ -8,6 +8,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
+    sync::watch,
     time::timeout,
 };
 
@@ -63,7 +64,7 @@ impl DnsProxy {
 }
 
 impl BoundDnsProxy {
-    pub async fn run(self) -> Result<(), String> {
+    pub async fn run_until_shutdown(self, shutdown: watch::Receiver<bool>) -> Result<(), String> {
         let Self {
             proxy,
             udp_socket,
@@ -71,21 +72,31 @@ impl BoundDnsProxy {
         } = self;
 
         tokio::try_join!(
-            proxy.clone().serve_udp(udp_socket),
-            proxy.serve_tcp(tcp_listener)
+            proxy.clone().serve_udp(udp_socket, shutdown.clone()),
+            proxy.serve_tcp(tcp_listener, shutdown.clone())
         )
         .map(|_| ())
     }
 }
 
 impl DnsProxy {
-    async fn serve_udp(self, socket: Arc<UdpSocket>) -> Result<(), String> {
+    async fn serve_udp(
+        self,
+        socket: Arc<UdpSocket>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), String> {
         loop {
             let mut request = vec![0_u8; MAX_DNS_PACKET_SIZE];
-            let (length, peer) = socket
-                .recv_from(&mut request)
-                .await
-                .map_err(|error| format!("receive DNS UDP query: {error}"))?;
+            let (length, peer) = tokio::select! {
+                received = socket.recv_from(&mut request) => received
+                    .map_err(|error| format!("receive DNS UDP query: {error}"))?,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
             request.truncate(length);
 
             let proxy = self.clone();
@@ -132,12 +143,22 @@ impl DnsProxy {
         Ok(())
     }
 
-    async fn serve_tcp(self, listener: TcpListener) -> Result<(), String> {
+    async fn serve_tcp(
+        self,
+        listener: TcpListener,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), String> {
         loop {
-            let (stream, peer) = listener
-                .accept()
-                .await
-                .map_err(|error| format!("accept DNS TCP client: {error}"))?;
+            let (stream, peer) = tokio::select! {
+                accepted = listener.accept() => accepted
+                    .map_err(|error| format!("accept DNS TCP client: {error}"))?,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
 
             let proxy = self.clone();
             tokio::spawn(async move {

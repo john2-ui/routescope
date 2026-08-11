@@ -1,4 +1,4 @@
-.PHONY: run check test fmt seed smoke namespace-up namespace-down namespace-status namespace-test namespace-collector-test
+.PHONY: run check test fmt clippy benchmark seed smoke namespace-up namespace-down namespace-status namespace-test namespace-collector-test
 
 run:
 	set -a && [ -f .env ] && . ./.env; set +a; cargo run
@@ -9,8 +9,14 @@ check:
 test:
 	cargo test
 
+clippy:
+	cargo clippy -- -D warnings
+
 fmt:
 	cargo fmt
+
+benchmark:
+	cargo run --quiet --release -- benchmark-storage $${ROUTESCOPE_BENCHMARK_FLOWS:-10000}
 
 seed:
 	set -a && [ -f .env ] && . ./.env; set +a; python3 scripts/seed_dev_data.py

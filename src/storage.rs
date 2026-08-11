@@ -5,18 +5,30 @@ use crate::domain::{
     DomainTrafficSummary, Flow, FlowCounters, FlowDirection, floor_to_minute_ms,
 };
 use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, Transaction, params};
-use std::sync::Mutex;
+use std::{io, sync::Mutex, time::Duration};
+
+const CURRENT_SCHEMA_VERSION: i32 = 1;
 
 /// RouteScope 持久化仓储接口。
 pub trait RouteScopeRepository: Send + Sync {
     /// 按 MAC 插入或更新设备。
+    #[allow(dead_code)]
     fn upsert_device(&self, device: &Device) -> SqliteResult<()>;
     /// 写入/更新 flow，并按计数增量更新分钟聚合。
+    #[allow(dead_code)]
     fn upsert_flow(&self, flow: &Flow) -> SqliteResult<()>;
+    /// 在一个 SQLite 事务中批量写入/更新 flow。
+    fn upsert_flows(&self, flows: &[Flow]) -> SqliteResult<usize>;
     /// 列出全部设备。
     fn list_devices(&self) -> SqliteResult<Vec<Device>>;
     /// 按 MAC 查询单个设备。
     fn find_device(&self, mac_address: &str) -> SqliteResult<Option<Device>>;
+    /// 更新设备手动显示名称；返回设备是否存在。
+    fn update_device_display_name(
+        &self,
+        mac_address: &str,
+        display_name: Option<&str>,
+    ) -> SqliteResult<bool>;
     /// 查询某设备全部 flow（按 last_seen 降序）。
     fn list_recent_flows(&self, mac_address: &str) -> SqliteResult<Vec<Flow>>;
     /// 查询某设备自 `since_ms` 起的分钟流量序列。
@@ -49,6 +61,7 @@ impl SqliteRepository {
     /// 打开文件数据库并执行 schema 迁移。
     pub fn open(path: &str) -> SqliteResult<Self> {
         let conn = Connection::open(path)?;
+        configure_connection(&conn, true)?;
         let repo = Self {
             conn: Mutex::new(conn),
         };
@@ -56,10 +69,10 @@ impl SqliteRepository {
         Ok(repo)
     }
 
-    /// 打开内存数据库（仅测试使用）。
-    #[cfg(test)]
+    /// 打开内存数据库（测试与离线性能基准使用）。
     pub fn open_in_memory() -> SqliteResult<Self> {
         let conn = Connection::open_in_memory()?;
+        configure_connection(&conn, false)?;
         let repo = Self {
             conn: Mutex::new(conn),
         };
@@ -67,12 +80,18 @@ impl SqliteRepository {
         Ok(repo)
     }
 
-    /// 创建 devices / flows / 分钟聚合表及索引。
+    /// 创建/升级 schema，并记录 SQLite `user_version`。
     fn migrate(&self) -> SqliteResult<()> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        conn.execute_batch(
-            r#"
-            PRAGMA foreign_keys = ON;
+        let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version > CURRENT_SCHEMA_VERSION {
+            return Err(unsupported_schema_error(version));
+        }
+
+        let tx = conn.unchecked_transaction()?;
+        if version < 1 {
+            tx.execute_batch(
+                r#"
             CREATE TABLE IF NOT EXISTS devices (
                 mac_address   TEXT PRIMARY KEY NOT NULL,
                 display_name  TEXT,
@@ -138,7 +157,10 @@ impl SqliteRepository {
                 created_at_ms INTEGER NOT NULL
             );
             "#,
-        )?;
+            )?;
+        }
+        tx.commit()?;
+        conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -175,6 +197,26 @@ impl SqliteRepository {
         )?;
         Ok(inserted == 1)
     }
+}
+
+fn configure_connection(conn: &Connection, enable_wal: bool) -> SqliteResult<()> {
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    if enable_wal {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+    }
+    Ok(())
+}
+
+fn unsupported_schema_error(version: i32) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "database schema version {version} is newer than supported version \
+             {CURRENT_SCHEMA_VERSION}"
+        ),
+    )))
 }
 
 /// 向设备分钟表累加上下行字节。
@@ -259,12 +301,9 @@ fn counter_from_sqlite_integer(value: i64, field: &str) -> SqliteResult<u64> {
         .map_err(|_| invalid_counter_error(format!("stored {field} must not be negative")))
 }
 
-impl RouteScopeRepository for SqliteRepository {
-    /// 按 MAC 插入或更新设备；保留已有 display_name，更新 current_ip。
-    fn upsert_device(&self, device: &Device) -> SqliteResult<()> {
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        conn.execute(
-            r#"
+fn upsert_device_tx(tx: &Transaction<'_>, device: &Device) -> SqliteResult<()> {
+    tx.execute(
+        r#"
         INSERT INTO devices (mac_address, display_name, current_ip, updated_at_ms)
         VALUES (?1, ?2, ?3, strftime('%s','now') * 1000)
         ON CONFLICT(mac_address) DO UPDATE SET
@@ -272,6 +311,176 @@ impl RouteScopeRepository for SqliteRepository {
             current_ip   = excluded.current_ip,
             updated_at_ms = excluded.updated_at_ms
         "#,
+        params![device.mac_address, device.display_name, device.current_ip],
+    )?;
+    Ok(())
+}
+
+fn upsert_flow_tx(tx: &Transaction<'_>, flow: &Flow) -> SqliteResult<()> {
+    let current_counters = FlowCounters::from_flow(flow);
+    let current_upload_bytes =
+        counter_to_sqlite_integer(current_counters.upload_bytes, "upload_bytes")?;
+    let current_download_bytes =
+        counter_to_sqlite_integer(current_counters.download_bytes, "download_bytes")?;
+    let current_packet_count =
+        counter_to_sqlite_integer(current_counters.packet_count, "packet_count")?;
+
+    upsert_device_tx(
+        tx,
+        &Device {
+            mac_address: flow.client_mac.clone(),
+            display_name: None,
+            current_ip: Some(flow.client_ip.clone()),
+        },
+    )?;
+
+    let (domain, domain_source, domain_confidence, domain_associated_at, domain_expires_at) =
+        match &flow.domain {
+            Some(d) => (
+                Some(d.domain.as_str()),
+                Some(d.source.as_str()),
+                Some(d.confidence.as_str()),
+                Some(d.associated_at),
+                d.expires_at,
+            ),
+            None => (None, None, None, None, None),
+        };
+
+    let previous: Option<FlowCounters> = tx
+        .query_row(
+            "SELECT upload_bytes, download_bytes, packet_count
+             FROM flows WHERE flow_id = ?1",
+            params![flow.flow_id],
+            |row| {
+                Ok(FlowCounters {
+                    upload_bytes: counter_from_sqlite_integer(row.get(0)?, "upload_bytes")?,
+                    download_bytes: counter_from_sqlite_integer(row.get(1)?, "download_bytes")?,
+                    packet_count: counter_from_sqlite_integer(row.get(2)?, "packet_count")?,
+                })
+            },
+        )
+        .optional()?;
+
+    let delta = match previous {
+        Some(previous) => current_counters
+            .delta_from(previous)
+            .map_err(|reset| invalid_counter_error(format!("flow {}: {reset}", flow.flow_id)))?,
+        None => current_counters,
+    };
+
+    tx.execute(
+        r#"
+            INSERT INTO flows (
+                flow_id, first_seen, last_seen, protocol, direction,
+                lan_interface, wan_interface,
+                client_mac, client_ip, client_port,
+                destination_ip, destination_port,
+                nat_source_ip, nat_source_port,
+                nat_destination_ip, nat_destination_port,
+                upload_bytes, download_bytes, packet_count,
+                domain, domain_source, domain_confidence,
+                domain_associated_at, domain_expires_at,
+                connection_state
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7,
+                ?8, ?9, ?10,
+                ?11, ?12,
+                ?13, ?14,
+                ?15, ?16,
+                ?17, ?18, ?19,
+                ?20, ?21, ?22,
+                ?23, ?24,
+                ?25
+            )
+            ON CONFLICT(flow_id) DO UPDATE SET
+                last_seen = excluded.last_seen,
+                upload_bytes = excluded.upload_bytes,
+                download_bytes = excluded.download_bytes,
+                packet_count = excluded.packet_count,
+                nat_source_ip = COALESCE(excluded.nat_source_ip, flows.nat_source_ip),
+                nat_source_port = COALESCE(excluded.nat_source_port, flows.nat_source_port),
+                nat_destination_ip = COALESCE(
+                    excluded.nat_destination_ip,
+                    flows.nat_destination_ip
+                ),
+                nat_destination_port = COALESCE(
+                    excluded.nat_destination_port,
+                    flows.nat_destination_port
+                ),
+                domain = excluded.domain,
+                domain_source = excluded.domain_source,
+                domain_confidence = excluded.domain_confidence,
+                domain_associated_at = excluded.domain_associated_at,
+                domain_expires_at = excluded.domain_expires_at,
+                connection_state = excluded.connection_state
+            "#,
+        params![
+            flow.flow_id,
+            flow.first_seen,
+            flow.last_seen,
+            flow.protocol,
+            flow.direction.as_str(),
+            flow.lan_interface,
+            flow.wan_interface,
+            flow.client_mac,
+            flow.client_ip,
+            flow.client_port as i64,
+            flow.destination_ip,
+            flow.destination_port as i64,
+            flow.nat_source_ip,
+            flow.nat_source_port.map(|v| v as i64),
+            flow.nat_destination_ip,
+            flow.nat_destination_port.map(|v| v as i64),
+            current_upload_bytes,
+            current_download_bytes,
+            current_packet_count,
+            domain,
+            domain_source,
+            domain_confidence,
+            domain_associated_at,
+            domain_expires_at,
+            flow.connection_state.as_str(),
+        ],
+    )?;
+
+    if delta.upload_bytes > 0 || delta.download_bytes > 0 {
+        let minute_ms = floor_to_minute_ms(flow.last_seen);
+        add_device_minute_bytes(
+            tx,
+            &flow.client_mac,
+            minute_ms,
+            delta.upload_bytes,
+            delta.download_bytes,
+        )?;
+        if let Some(attribution) = &flow.domain {
+            add_domain_minute_bytes(
+                tx,
+                &flow.client_mac,
+                attribution,
+                minute_ms,
+                delta.upload_bytes,
+                delta.download_bytes,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+impl RouteScopeRepository for SqliteRepository {
+    /// 按 MAC 插入或更新设备；保留已有 display_name，更新 current_ip。
+    fn upsert_device(&self, device: &Device) -> SqliteResult<()> {
+        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO devices (mac_address, display_name, current_ip, updated_at_ms)
+            VALUES (?1, ?2, ?3, strftime('%s','now') * 1000)
+            ON CONFLICT(mac_address) DO UPDATE SET
+                display_name = COALESCE(excluded.display_name, devices.display_name),
+                current_ip = excluded.current_ip,
+                updated_at_ms = excluded.updated_at_ms
+            "#,
             params![device.mac_address, device.display_name, device.current_ip],
         )?;
         Ok(())
@@ -279,159 +488,27 @@ impl RouteScopeRepository for SqliteRepository {
 
     /// 校验并 upsert flow；按计数增量更新设备/域名分钟聚合。
     fn upsert_flow(&self, flow: &Flow) -> SqliteResult<()> {
-        flow.validate()
-            .map_err(|msg| rusqlite::Error::ToSqlConversionFailure(msg.into()))?;
+        self.upsert_flows(std::slice::from_ref(flow))?;
+        Ok(())
+    }
 
-        let current_counters = FlowCounters::from_flow(flow);
-        let current_upload_bytes =
-            counter_to_sqlite_integer(current_counters.upload_bytes, "upload_bytes")?;
-        let current_download_bytes =
-            counter_to_sqlite_integer(current_counters.download_bytes, "download_bytes")?;
-        let current_packet_count =
-            counter_to_sqlite_integer(current_counters.packet_count, "packet_count")?;
-
-        self.upsert_device(&Device {
-            mac_address: flow.client_mac.clone(),
-            display_name: None,
-            current_ip: Some(flow.client_ip.clone()),
-        })?;
-
-        let (domain, domain_source, domain_confidence, domain_associated_at, domain_expires_at) =
-            match &flow.domain {
-                Some(d) => (
-                    Some(d.domain.as_str()),
-                    Some(d.source.as_str()),
-                    Some(d.confidence.as_str()),
-                    Some(d.associated_at),
-                    d.expires_at,
-                ),
-                None => (None, None, None, None, None),
-            };
+    /// Batch flow writes in a single transaction to avoid one lock/commit per flow.
+    fn upsert_flows(&self, flows: &[Flow]) -> SqliteResult<usize> {
+        for flow in flows {
+            flow.validate()
+                .map_err(|msg| rusqlite::Error::ToSqlConversionFailure(msg.into()))?;
+        }
+        if flows.is_empty() {
+            return Ok(0);
+        }
 
         let mut conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let tx = conn.transaction()?;
-
-        let previous: Option<FlowCounters> = tx
-            .query_row(
-                "SELECT upload_bytes, download_bytes, packet_count
-                 FROM flows WHERE flow_id = ?1",
-                params![flow.flow_id],
-                |row| {
-                    Ok(FlowCounters {
-                        upload_bytes: counter_from_sqlite_integer(row.get(0)?, "upload_bytes")?,
-                        download_bytes: counter_from_sqlite_integer(row.get(1)?, "download_bytes")?,
-                        packet_count: counter_from_sqlite_integer(row.get(2)?, "packet_count")?,
-                    })
-                },
-            )
-            .optional()?;
-
-        let delta = match previous {
-            Some(previous) => current_counters.delta_from(previous).map_err(|reset| {
-                invalid_counter_error(format!("flow {}: {reset}", flow.flow_id))
-            })?,
-            None => current_counters,
-        };
-
-        tx.execute(
-            r#"
-                INSERT INTO flows (
-                    flow_id, first_seen, last_seen, protocol, direction,
-                    lan_interface, wan_interface,
-                    client_mac, client_ip, client_port,
-                    destination_ip, destination_port,
-                    nat_source_ip, nat_source_port,
-                    nat_destination_ip, nat_destination_port,
-                    upload_bytes, download_bytes, packet_count,
-                    domain, domain_source, domain_confidence,
-                    domain_associated_at, domain_expires_at,
-                    connection_state
-                ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5,
-                    ?6, ?7,
-                    ?8, ?9, ?10,
-                    ?11, ?12,
-                    ?13, ?14,
-                    ?15, ?16,
-                    ?17, ?18, ?19,
-                    ?20, ?21, ?22,
-                    ?23, ?24,
-                    ?25
-                )
-                ON CONFLICT(flow_id) DO UPDATE SET
-                    last_seen = excluded.last_seen,
-                    upload_bytes = excluded.upload_bytes,
-                    download_bytes = excluded.download_bytes,
-                    packet_count = excluded.packet_count,
-                    nat_source_ip = COALESCE(excluded.nat_source_ip, flows.nat_source_ip),
-                    nat_source_port = COALESCE(excluded.nat_source_port, flows.nat_source_port),
-                    nat_destination_ip = COALESCE(
-                        excluded.nat_destination_ip,
-                        flows.nat_destination_ip
-                    ),
-                    nat_destination_port = COALESCE(
-                        excluded.nat_destination_port,
-                        flows.nat_destination_port
-                    ),
-                    domain = excluded.domain,
-                    domain_source = excluded.domain_source,
-                    domain_confidence = excluded.domain_confidence,
-                    domain_associated_at = excluded.domain_associated_at,
-                    domain_expires_at = excluded.domain_expires_at,
-                    connection_state = excluded.connection_state
-                "#,
-            params![
-                flow.flow_id,
-                flow.first_seen,
-                flow.last_seen,
-                flow.protocol,
-                flow.direction.as_str(),
-                flow.lan_interface,
-                flow.wan_interface,
-                flow.client_mac,
-                flow.client_ip,
-                flow.client_port as i64,
-                flow.destination_ip,
-                flow.destination_port as i64,
-                flow.nat_source_ip,
-                flow.nat_source_port.map(|v| v as i64),
-                flow.nat_destination_ip,
-                flow.nat_destination_port.map(|v| v as i64),
-                current_upload_bytes,
-                current_download_bytes,
-                current_packet_count,
-                domain,
-                domain_source,
-                domain_confidence,
-                domain_associated_at,
-                domain_expires_at,
-                flow.connection_state.as_str(),
-            ],
-        )?;
-
-        if delta.upload_bytes > 0 || delta.download_bytes > 0 {
-            let minute_ms = floor_to_minute_ms(flow.last_seen);
-            add_device_minute_bytes(
-                &tx,
-                &flow.client_mac,
-                minute_ms,
-                delta.upload_bytes,
-                delta.download_bytes,
-            )?;
-            if let Some(attribution) = &flow.domain {
-                add_domain_minute_bytes(
-                    &tx,
-                    &flow.client_mac,
-                    attribution,
-                    minute_ms,
-                    delta.upload_bytes,
-                    delta.download_bytes,
-                )?;
-            }
+        for flow in flows {
+            upsert_flow_tx(&tx, flow)?;
         }
-
         tx.commit()?;
-        Ok(())
+        Ok(flows.len())
     }
 
     /// 列出全部设备（按 MAC 排序）。
@@ -473,6 +550,24 @@ impl RouteScopeRepository for SqliteRepository {
             },
         )
         .optional()
+    }
+
+    /// Update a manual device name without creating an unknown device.
+    fn update_device_display_name(
+        &self,
+        mac_address: &str,
+        display_name: Option<&str>,
+    ) -> SqliteResult<bool> {
+        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+        let updated = conn.execute(
+            r#"
+            UPDATE devices
+            SET display_name = ?1, updated_at_ms = strftime('%s','now') * 1000
+            WHERE mac_address = ?2
+            "#,
+            params![display_name, mac_address],
+        )?;
+        Ok(updated == 1)
     }
 
     /// 查询某设备全部 flow（含域名归因），按 last_seen 降序。
@@ -714,6 +809,60 @@ mod tests {
         let found = repo.find_device("aa:bb:cc:dd:ee:ff").unwrap().unwrap();
         assert_eq!(found, device);
         assert_eq!(repo.list_devices().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_records_supported_schema_version() {
+        let repo = SqliteRepository::open_in_memory().unwrap();
+        let version: i32 = {
+            let conn = repo.conn.lock().unwrap();
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn batch_upsert_is_atomic_when_one_flow_is_invalid() {
+        let repo = SqliteRepository::open_in_memory().unwrap();
+        let valid = sample_flow("batch-valid", "aa:bb:cc:dd:ee:01", 10_000);
+        let mut invalid = sample_flow("batch-invalid", "aa:bb:cc:dd:ee:02", 10_000);
+        invalid.client_mac.clear();
+
+        assert!(repo.upsert_flows(&[valid, invalid]).is_err());
+        assert!(repo.list_devices().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_device_name_can_be_updated_and_cleared() {
+        let repo = SqliteRepository::open_in_memory().unwrap();
+        let mac = "aa:bb:cc:dd:ee:ff";
+        repo.upsert_device(&Device {
+            mac_address: mac.to_owned(),
+            display_name: None,
+            current_ip: Some("192.168.1.10".to_owned()),
+        })
+        .unwrap();
+
+        assert!(
+            repo.update_device_display_name(mac, Some("Living Room TV"))
+                .unwrap()
+        );
+        assert_eq!(
+            repo.find_device(mac)
+                .unwrap()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Living Room TV")
+        );
+        assert!(repo.update_device_display_name(mac, None).unwrap());
+        assert_eq!(repo.find_device(mac).unwrap().unwrap().display_name, None);
+        assert!(
+            !repo
+                .update_device_display_name("ff:ff:ff:ff:ff:ff", Some("missing"))
+                .unwrap()
+        );
     }
 
     #[test]

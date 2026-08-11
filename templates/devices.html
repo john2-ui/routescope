@@ -20,10 +20,41 @@
   <main>
     <p class="eyebrow">设备</p>
     <h1>网络设备</h1>
+    {% if devices.is_empty() %}
     <section class="empty-state">
       <h2>尚未识别设备</h2>
-      <p>TODO: 根据 MAC、DHCP 与 ARP 记录加载设备列表，并支持设置手动名称。</p>
+      <p>采集到第一条 Flow 后，设备会以 MAC 地址作为稳定身份出现在这里。</p>
     </section>
+    {% else %}
+    <section class="panel">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>设备</th><th>当前 IP</th><th>最近 24 小时</th><th>流量</th><th>域名 Top</th><th>手动命名</th></tr>
+          </thead>
+          <tbody>
+          {% for device in devices %}
+            <tr>
+              <td><a href="/devices/{{ device.mac_address }}"><strong>{{ device.display_name }}</strong></a><small>{{ device.mac_address }}</small></td>
+              <td>{{ device.current_ip }}</td>
+              <td>{{ device.flow_count }} 条连接<br><small>最近 {{ device.last_seen }}</small></td>
+              <td>{{ device.total_bytes }}<br><small><span class="traffic-up">{{ device.upload_bytes }}</span> / <span class="traffic-down">{{ device.download_bytes }}</span></small></td>
+              <td>{{ device.top_domain }}<small>{{ device.top_domain_meta }}</small></td>
+              <td>
+                <form method="post" action="/devices/{{ device.mac_address }}/name" class="inline-form">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <label class="sr-only" for="name-{{ device.mac_address }}">设备名称</label>
+                  <input id="name-{{ device.mac_address }}" name="display_name" value="{{ device.raw_name }}" maxlength="128" placeholder="例如：客厅电视">
+                  <button type="submit">保存</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    {% endif %}
   </main>
 </body>
 </html>

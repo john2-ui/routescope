@@ -1,19 +1,22 @@
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
+use serde::Deserialize;
 
 use crate::auth;
-use crate::domain::{Device, DeviceMinuteStat, DomainTrafficSummary, Flow};
+use crate::domain::{Device, DeviceMinuteStat, DomainTrafficSummary, Flow, normalize_display_name};
 use crate::state::AppState;
 
 /// 注册公开 API 路由（健康检查）。
 pub fn public_routes() -> Router<AppState> {
-    Router::new().route("/healthz", get(health_check))
+    Router::new()
+        .route("/healthz", get(health_check))
+        .route("/readyz", get(readiness_check))
 }
 
 /// 注册需鉴权的设备/流量/域名 JSON API。
@@ -24,12 +27,45 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route("/api/v1/devices/{mac_address}/traffic", get(device_traffic))
         .route("/api/v1/devices/{mac_address}/flows", get(device_flows))
         .route("/api/v1/devices/{mac_address}/domains", get(device_domains))
+        .route(
+            "/api/v1/devices/{mac_address}/name",
+            post(update_device_name),
+        )
         .route_layer(middleware::from_fn_with_state(state, auth::require_admin))
 }
 
-/// 健康检查，返回 `{"status":"ok"}`。
-async fn health_check() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok" }))
+/// Liveness check; collector failures are reported in the payload, not as a
+/// process liveness failure.
+async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
+    let collector = state.collector_health.snapshot();
+    let status = if collector.state == "unhealthy" {
+        "degraded"
+    } else {
+        "ok"
+    };
+    Json(serde_json::json!({
+        "status": status,
+        "collector": collector,
+    }))
+}
+
+/// Readiness check; startup succeeds only after configured sources are bound,
+/// while runtime collector failures flip the endpoint to unavailable.
+async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
+    let collector = state.collector_health.snapshot();
+    let ready = collector.ready;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if ready { "ready" } else { "starting" },
+            "collector": collector,
+        })),
+    )
 }
 
 /// 返回全部设备列表。
@@ -101,6 +137,49 @@ async fn device_domains(
             eprintln!("device_domains failed: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceNameRequest {
+    display_name: Option<String>,
+}
+
+/// Update or clear a device's manual display name.
+async fn update_device_name(
+    State(state): State<AppState>,
+    Path(mac_address): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceNameRequest>,
+) -> Result<Json<Device>, StatusCode> {
+    let csrf_token = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !auth::csrf_request_is_valid(&state, &headers, csrf_token) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let display_name = normalize_display_name(request.display_name.as_deref())
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    match state
+        .observation
+        .rename_device(&mac_address, display_name.as_deref())
+    {
+        Ok(true) => state
+            .observation
+            .device(&mac_address)
+            .map_err(|error| {
+                eprintln!("device lookup after rename failed: {error}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .map(Json)
+            .ok_or(StatusCode::NOT_FOUND),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            eprintln!("device rename failed: {error}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// 确认设备存在；不存在返回 404，查询失败返回 500。

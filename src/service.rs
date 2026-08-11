@@ -68,13 +68,19 @@ impl ObservationService {
             .list_domain_traffic_top(mac_address, cutoff, DEFAULT_DOMAIN_TOP_LIMIT)
     }
 
+    /// Update a device's manual display name without changing its MAC identity.
+    pub fn rename_device(
+        &self,
+        mac_address: &str,
+        display_name: Option<&str>,
+    ) -> Result<bool, rusqlite::Error> {
+        self.repo
+            .update_device_display_name(mac_address, display_name)
+    }
+
     /// 批量写入 flow，返回成功写入条数。
     pub fn ingest_flows(&self, flows: &[Flow]) -> Result<usize, rusqlite::Error> {
-        for flow in flows {
-            self.repo.upsert_flow(flow)?;
-        }
-
-        Ok(flows.len())
+        self.repo.upsert_flows(flows)
     }
 
     /// 按当前时间与保留策略清理过期 flow 与聚合数据。

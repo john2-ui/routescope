@@ -1,7 +1,7 @@
 //! Kernel and network data-source boundaries.
 //!
-//! The TC eBPF collector and conntrack enrichment live here; the local DNS
-//! proxy remains a future data source.
+//! The TC eBPF collector and conntrack enrichment live here. DNS observations
+//! are intentionally kept in the separate DNS proxy/cache boundary.
 
 use crate::{
     conntrack::{Association, ConntrackReader},
@@ -39,6 +39,17 @@ pub enum CollectorHealthState {
     Healthy,
     Degraded,
     Unhealthy,
+}
+
+impl CollectorHealthState {
+    /// Return the stable wire-format value used by health endpoints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,11 +538,15 @@ impl SimulatedCollector {
     /// 以固定起点与间隔创建模拟采集器。
     fn with_start_time_and_interval(start_ms: i64, interval_secs: u64) -> Self {
         let step_ms = i64::try_from(interval_secs.max(1).saturating_mul(1_000)).unwrap_or(i64::MAX);
+        // Prefer start_ms so each process restart gets a new flow_id namespace; otherwise a
+        // restarted simulator would resume from tick 1 against higher counters still in SQLite.
+        let session_id = u64::try_from(start_ms.max(0))
+            .unwrap_or_else(|_| NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed));
 
         Self {
             start_ms,
             step_ms,
-            session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            session_id,
             tick: AtomicU64::new(0),
         }
     }
