@@ -72,6 +72,7 @@ Linux namespace 集成环境（需要 root、`iproute2`、`nftables`、`curl` �
 sudo make namespace-up
 sudo make namespace-test
 make namespace-collector-test
+make namespace-dns-test
 sudo make namespace-down
 ```
 
@@ -79,6 +80,11 @@ sudo make namespace-down
 IPv4 NAT 访问 WAN namespace 的 HTTP 服务。`make namespace-collector-test`
 会先构建当前 RouteScope，再在 router namespace 内启动服务，验证真实 TC
 eBPF 双向 Flow 能按客户端 MAC 出现在 API 中，并在启用 conntrack 时补齐 NAT 映射。
+`make namespace-dns-test` 运行 `tests/namespace_dns.rs` 的特权集成测试，额外验证
+DNS UDP/TCP 转发、域名归因、LAN `rx/tx` 计数核对以及两个客户端的可配置大流量并发。
+默认大流量大小为 1 MiB，可通过
+`ROUTESCOPE_NAMESPACE_LARGE_PAYLOAD_BYTES` 调整。详细结果与后续缺口见
+[首版网络验收基线](docs/acceptance-baseline.md)。
 
 ## 项目结构
 
@@ -96,6 +102,9 @@ src/service.rs 观测查询、Flow 写入和保留期清理
 src/storage.rs SQLite 仓储、分钟聚合与清理
 src/web.rs     服务端渲染页面与静态资源路由
 scripts/namespace_lab.sh namespace 拓扑创建、清理和 smoke test
+scripts/dns_test_server.py 确定性 UDP/TCP DNS 上游测试服务
+tests/namespace_dns.rs namespace DNS 与流量归因集成测试
+docs/acceptance-baseline.md 首版网络验收结果与后续优先级
 templates/     Askama HTML 模板
 static/        CSS 等静态资源
 config/        示例配置

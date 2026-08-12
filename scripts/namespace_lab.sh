@@ -17,6 +17,9 @@ LAN_ROUTER_IP="10.0.0.1"
 WAN_ROUTER_IP="10.0.2.1"
 WAN_SERVER_IP="10.0.2.2"
 UDP_SERVER_PORT="9090"
+LARGE_PAYLOAD_BYTES="${ROUTESCOPE_NAMESPACE_LARGE_PAYLOAD_BYTES:-1048576}"
+LARGE_FILE_NAME=".routescope-namespace-large-$$.bin"
+LARGE_FILE_PATH="$ROOT/$LARGE_FILE_NAME"
 
 HTTP_SERVER_PID=""
 HTTP_SERVER_LOG=""
@@ -25,6 +28,10 @@ UDP_SERVER_LOG=""
 ROUTESCOPE_PID=""
 ROUTESCOPE_LOG=""
 ROUTESCOPE_DB=""
+
+DNS_DOMAIN="routescope.test"
+DNS_SERVER_LOG=""
+DNS_SERVER_PID=""
 
 # Topology (namespaces + addressing):
 #
@@ -131,6 +138,15 @@ table ip routescope_nat {
         oifname "wan0" ip saddr 10.0.0.0/24 masquerade
     }
 }
+
+table ip routescope_dns {
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+
+        iifname "br-lan" udp dport 53 redirect to :5353
+        iifname "br-lan" tcp dport 53 redirect to :5353
+    }
+}
 EOF
 }
 
@@ -227,6 +243,16 @@ stop_wan_udp_processes() {
     ns_exec "$WAN_NS" pkill -KILL -f 'routescope-udp-server' 2>/dev/null || true
 }
 
+stop_wan_dns_processes() {
+    if ! namespace_exists "$WAN_NS"; then
+        return 0
+    fi
+
+    ns_exec "$WAN_NS" pkill -TERM -f 'dns_test_server.py' 2>/dev/null || true
+    sleep 0.1
+    ns_exec "$WAN_NS" pkill -KILL -f 'dns_test_server.py' 2>/dev/null || true
+}
+
 stop_routescope_processes() {
     if ! namespace_exists "$ROUTER_NS"; then
         return 0
@@ -245,6 +271,12 @@ reset_routescope_tc() {
     ns_exec "$ROUTER_NS" tc qdisc del dev br-lan clsact 2>/dev/null || true
 }
 
+read_lan_counter() {
+    local counter_name=$1
+    ns_exec "$ROUTER_NS" cat \
+        "/sys/class/net/br-lan/statistics/${counter_name}_bytes"
+}
+
 cleanup_http_server() {
     if [[ -n "$HTTP_SERVER_PID" ]]; then
         kill "$HTTP_SERVER_PID" 2>/dev/null || true
@@ -258,8 +290,15 @@ cleanup_http_server() {
         UDP_SERVER_PID=""
     fi
 
+    if [[ -n "$DNS_SERVER_PID" ]]; then
+        kill "$DNS_SERVER_PID" 2>/dev/null || true
+        wait "$DNS_SERVER_PID" 2>/dev/null || true
+        DNS_SERVER_PID=""
+    fi
+
     stop_wan_http_processes
     stop_wan_udp_processes
+    stop_wan_dns_processes
 
     if [[ -n "$HTTP_SERVER_LOG" ]]; then
         rm -f "$HTTP_SERVER_LOG"
@@ -270,6 +309,13 @@ cleanup_http_server() {
         rm -f "$UDP_SERVER_LOG"
         UDP_SERVER_LOG=""
     fi
+
+    if [[ -n "$DNS_SERVER_LOG" ]]; then
+        rm -f "$DNS_SERVER_LOG"
+        DNS_SERVER_LOG=""
+    fi
+
+    rm -f "$LARGE_FILE_PATH"
 }
 
 cleanup_routescope() {
@@ -318,6 +364,10 @@ start_routescope_collector() {
         ROUTESCOPE_WAN_INTERFACE=wan0 \
         ROUTESCOPE_COLLECT_INTERVAL_SECS=1 \
         ROUTESCOPE_CONNTRACK_REFRESH_INTERVAL_SECS=1 \
+        ROUTESCOPE_ENABLE_DNS_PROXY=1 \
+        ROUTESCOPE_DNS_LISTEN_ADDR=0.0.0.0:5353 \
+        ROUTESCOPE_DNS_UPSTREAM_ADDR=10.0.2.2:53 \
+        ROUTESCOPE_DNS_QUERY_TIMEOUT_MS=1000 \
         "$ROOT/target/debug/routescope" \
         >"$ROUTESCOPE_LOG" 2>&1 &
     ROUTESCOPE_PID=$!
@@ -380,13 +430,16 @@ matches = [
     and flow["protocol"] == protocol
     and flow["destination_port"] == destination_port
 ]
-if len(matches) != 1:
+if not matches:
     raise SystemExit(
-        f"expected one {protocol}:{destination_port} flow for {mac}, "
-        f"got {len(matches)}: {data}"
+        f"expected at least one {protocol}:{destination_port} flow for {mac}, "
+        f"got none: {data}"
     )
 
-flow = matches[0]
+flow = max(
+    matches,
+    key=lambda candidate: candidate["upload_bytes"] + candidate["download_bytes"],
+)
 if flow["direction"] != "bidirectional":
     raise SystemExit(f"flow is not bidirectional: {flow}")
 if flow["packet_count"] <= 0 or flow["upload_bytes"] <= 0 or flow["download_bytes"] <= 0:
@@ -399,8 +452,105 @@ if flow["nat_destination_port"] != destination_port:
     raise SystemExit(f"unexpected translated destination port: {flow}")
 if flow["connection_state"] == "unknown":
     raise SystemExit(f"conntrack state was not associated: {flow}")
+
+if protocol == "tcp" and destination_port == 8080:
+    attribution = flow.get("domain")
+
+    if not attribution:
+        raise SystemExit(f"flow has no DNS attribution: {flow}")
+
+    if attribution["domain"] != "routescope.test":
+        raise SystemExit(f"unexpected domain: {flow}")
+
+    if attribution["source"] != "dns":
+        raise SystemExit(f"unexpected domain source: {flow}")
+
+    if attribution["confidence"] != "high":
+        raise SystemExit(f"unexpected domain confidence: {flow}")
+
 print(f"ok: bidirectional {protocol}:{destination_port} flow with NAT for {mac}")
 ' "$mac_address" "$protocol" "$destination_port" <<<"$flows_json"
+}
+
+assert_collector_large_flow() {
+    local mac_address=$1
+    local expected_bytes=$2
+    local flows_json=$3
+
+    python3 -c '
+import json
+import sys
+
+mac, expected_bytes = sys.argv[1], int(sys.argv[2])
+data = json.load(sys.stdin)
+matches = [
+    flow for flow in data
+    if flow["client_mac"] == mac
+    and flow["protocol"] == "tcp"
+    and flow["destination_port"] == 8080
+    and flow["download_bytes"] >= expected_bytes
+]
+if not matches:
+    raise SystemExit(
+        f"expected a large tcp:8080 flow for {mac} with at least "
+        f"{expected_bytes} download bytes: {data}"
+    )
+
+flow = max(matches, key=lambda candidate: candidate["download_bytes"])
+attribution = flow.get("domain")
+if not attribution or attribution["domain"] != "routescope.test":
+    raise SystemExit(f"large flow has no expected DNS attribution: {flow}")
+if attribution["source"] != "dns" or attribution["confidence"] != "high":
+    raise SystemExit(f"large flow has unexpected DNS metadata: {flow}")
+
+download_bytes = flow["download_bytes"]
+print(
+    f"ok: large tcp:8080 flow for {mac} has "
+    f"{download_bytes} download bytes"
+)
+' "$mac_address" "$expected_bytes" <<<"$flows_json"
+}
+
+assert_interface_counters() {
+    local rx_before=$1
+    local tx_before=$2
+    local rx_after=$3
+    local tx_after=$4
+    local laptop_flows=$5
+    local phone_flows=$6
+
+    python3 - "$rx_before" "$tx_before" "$rx_after" "$tx_after" \
+        "$laptop_flows" "$phone_flows" <<'PY'
+import json
+import sys
+
+rx_before, tx_before, rx_after, tx_after = map(int, sys.argv[1:5])
+flows = json.loads(sys.argv[5]) + json.loads(sys.argv[6])
+upload_bytes = sum(flow["upload_bytes"] for flow in flows)
+download_bytes = sum(flow["download_bytes"] for flow in flows)
+rx_delta = rx_after - rx_before
+tx_delta = tx_after - tx_before
+
+
+def check_counter(name, observed, expected):
+    error = abs(observed - expected)
+    tolerance = max(4096, int(expected * 0.20))
+    if error > tolerance:
+        raise SystemExit(
+            f"{name} counter mismatch: interface={observed}, "
+            f"flows={expected}, error={error}, allowed={tolerance}"
+        )
+
+    ratio = (error / expected * 100) if expected else 0
+    print(
+        f"ok: {name} counter interface={observed} flows={expected} "
+        f"error={ratio:.2f}% allowed={tolerance}"
+    )
+
+
+check_counter("upload/rx", rx_delta, upload_bytes)
+check_counter("download/tx", tx_delta, download_bytes)
+PY
 }
 
 test_collector_api() {
@@ -496,6 +646,42 @@ test_client_http() {
     echo "ok: $client_name reached WAN through NAT"
 }
 
+prepare_large_http_payload() {
+    case "$LARGE_PAYLOAD_BYTES" in
+        ""|0|*[!0-9]*)
+            echo "error: ROUTESCOPE_NAMESPACE_LARGE_PAYLOAD_BYTES must be a positive integer" >&2
+            return 1
+            ;;
+    esac
+
+    python3 - "$LARGE_FILE_PATH" "$LARGE_PAYLOAD_BYTES" <<'PY'
+import sys
+
+path = sys.argv[1]
+size = int(sys.argv[2])
+chunk = b"\0" * (1024 * 1024)
+
+with open(path, "wb") as output:
+    remaining = size
+    while remaining:
+        length = min(remaining, len(chunk))
+        output.write(chunk[:length])
+        remaining -= length
+PY
+}
+
+test_client_large_http() {
+    local namespace=$1
+    local client_name=$2
+
+    ns_exec "$namespace" curl \
+        --fail --silent --show-error --max-time 30 \
+        -o /dev/null \
+        "http://${WAN_SERVER_IP}:8080/${LARGE_FILE_NAME}"
+
+    echo "ok: $client_name downloaded ${LARGE_PAYLOAD_BYTES} bytes through NAT"
+}
+
 start_wan_udp_server() {
     UDP_SERVER_LOG="${TMPDIR:-/tmp}/routescope-wan-udp.$$.log"
     : >"$UDP_SERVER_LOG"
@@ -553,6 +739,86 @@ PY
     echo "ok: $client_name exchanged UDP traffic through NAT"
 }
 
+start_wan_dns_server() {
+    DNS_SERVER_LOG="${TMPDIR:-/tmp}/routescope-wan-dns.$$.log"
+    : >"$DNS_SERVER_LOG"
+
+    ns_exec "$WAN_NS" python3 -u \
+        "$ROOT/scripts/dns_test_server.py" "$WAN_SERVER_IP" \
+        >"$DNS_SERVER_LOG" 2>&1 &
+
+    DNS_SERVER_PID=$!
+
+    for _ in {1..20}; do
+        if awk '/routescope-dns-server-ready/ { found = 1 } END { exit !found }' \
+            "$DNS_SERVER_LOG"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    cat "$DNS_SERVER_LOG" >&2
+    return 1
+}
+
+
+test_client_dns() {
+    local namespace=$1
+    local protocol=$2
+
+    ns_exec "$namespace" python3 - "$LAN_ROUTER_IP" "$WAN_SERVER_IP" "$protocol" <<'PY'
+import socket
+import struct
+import sys
+
+router_ip = sys.argv[1]
+target_ip = socket.inet_aton(sys.argv[2])
+protocol = sys.argv[3]
+
+query_id = 0x1234
+name = b"".join(
+    bytes([len(label)]) + label.encode()
+    for label in "routescope.test".split(".")
+) + b"\x00"
+
+query = (
+    struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0)
+    + name
+    + struct.pack("!HH", 1, 1)
+)
+
+
+def read_exact(stream, size):
+    data = b""
+    while len(data) < size:
+        chunk = stream.recv(size - len(data))
+        if not chunk:
+            raise RuntimeError("DNS TCP connection closed")
+        data += chunk
+    return data
+
+
+if protocol == "udp":
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2)
+    sock.sendto(query, (router_ip, 53))
+    response, _ = sock.recvfrom(4096)
+else:
+    sock = socket.create_connection((router_ip, 53), timeout=2)
+    sock.sendall(struct.pack("!H", len(query)) + query)
+    length = struct.unpack("!H", read_exact(sock, 2))[0]
+    response = read_exact(sock, length)
+
+if query_id.to_bytes(2, "big") not in response:
+    raise SystemExit("DNS transaction ID mismatch")
+
+if target_ip not in response:
+    raise SystemExit("DNS response did not contain expected A record")
+
+print(f"ok: {protocol} DNS query returned {sys.argv[2]}")
+PY
+}
+
 test_topology() {
     require_root
     require_commands ip curl python3 awk pkill
@@ -583,6 +849,12 @@ test_topology() {
 test_collector() {
     require_root
     require_commands ip curl python3 awk pkill tc
+    local lan_rx_before=""
+    local lan_tx_before=""
+    local lan_rx_after=""
+    local lan_tx_after=""
+    local laptop_flows=""
+    local phone_flows=""
 
     for namespace in "$CLIENT_A_NS" "$CLIENT_B_NS" "$ROUTER_NS" "$WAN_NS"; do
         if ! namespace_exists "$namespace"; then
@@ -595,6 +867,7 @@ test_collector() {
     trap 'cleanup_routescope; cleanup_http_server' EXIT
     start_routescope_collector
 
+    prepare_large_http_payload
     HTTP_SERVER_LOG="${TMPDIR:-/tmp}/routescope-wan-http.$$.log"
     : >"$HTTP_SERVER_LOG"
     ns_exec "$WAN_NS" python3 -u -m http.server 8080 --bind "$WAN_SERVER_IP" \
@@ -602,6 +875,14 @@ test_collector() {
     HTTP_SERVER_PID=$!
 
     start_wan_udp_server
+    start_wan_dns_server
+
+    lan_rx_before=$(read_lan_counter rx)
+    lan_tx_before=$(read_lan_counter tx)
+
+    test_client_dns "$CLIENT_A_NS" udp
+    test_client_dns "$CLIENT_B_NS" udp
+    test_client_dns "$CLIENT_A_NS" tcp
 
     test_client_http "$CLIENT_A_NS" "client-a" &
     local client_a_http_pid=$!
@@ -610,9 +891,34 @@ test_collector() {
     wait "$client_a_http_pid"
     wait "$client_b_http_pid"
 
+    test_client_large_http "$CLIENT_A_NS" "client-a" &
+    local client_a_large_http_pid=$!
+    test_client_large_http "$CLIENT_B_NS" "client-b" &
+    local client_b_large_http_pid=$!
+    wait "$client_a_large_http_pid"
+    wait "$client_b_large_http_pid"
+
     test_client_udp "$CLIENT_A_NS" "client-a"
     test_client_udp "$CLIENT_B_NS" "client-b"
     test_collector_api
+
+    laptop_flows=$(ns_exec "$ROUTER_NS" curl \
+        --fail --silent --max-time 1 \
+        "http://127.0.0.1:8080/api/v1/devices/${CLIENT_A_MAC}/flows")
+    phone_flows=$(ns_exec "$ROUTER_NS" curl \
+        --fail --silent --max-time 1 \
+        "http://127.0.0.1:8080/api/v1/devices/${CLIENT_B_MAC}/flows")
+
+    lan_rx_after=$(read_lan_counter rx)
+    lan_tx_after=$(read_lan_counter tx)
+
+    assert_collector_large_flow \
+        "$CLIENT_A_MAC" "$((LARGE_PAYLOAD_BYTES * 95 / 100))" "$laptop_flows"
+    assert_collector_large_flow \
+        "$CLIENT_B_MAC" "$((LARGE_PAYLOAD_BYTES * 95 / 100))" "$phone_flows"
+    assert_interface_counters \
+        "$lan_rx_before" "$lan_tx_before" "$lan_rx_after" "$lan_tx_after" \
+        "$laptop_flows" "$phone_flows"
 
     echo "namespace TC eBPF collector test passed"
 }

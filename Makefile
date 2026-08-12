@@ -1,4 +1,4 @@
-.PHONY: run check test fmt clippy benchmark seed smoke namespace-up namespace-down namespace-status namespace-test namespace-collector-test
+.PHONY: run check test fmt clippy benchmark seed smoke namespace-up namespace-down namespace-status namespace-test namespace-collector-test namespace-dns-test
 
 run:
 	set -a && [ -f .env ] && . ./.env; set +a; cargo run
@@ -39,3 +39,7 @@ namespace-test:
 namespace-collector-test:
 	cargo build
 	sudo scripts/namespace_lab.sh collector-test
+
+namespace-dns-test:
+	cargo build
+	cargo test --test namespace_dns -- --ignored --nocapture
