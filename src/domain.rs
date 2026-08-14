@@ -26,6 +26,26 @@ pub fn normalize_display_name(value: Option<&str>) -> Result<Option<String>, &'s
         Ok((!value.is_empty()).then(|| value.to_owned()))
 }
 
+/// Normalize and validate a DNS/SNI domain name used by queries and deletion scopes.
+pub fn normalize_domain_name(value: &str) -> Result<String, &'static str> {
+        let domain = value.trim().trim_end_matches('.').to_ascii_lowercase();
+        if domain.is_empty()
+                || domain.len() > 253
+                || domain.split('.').any(|label| {
+                        label.is_empty()
+                                || label.len() > 63
+                                || label.starts_with('-')
+                                || label.ends_with('-')
+                                || !label
+                                        .bytes()
+                                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+        {
+                return Err("domain must be a valid DNS name");
+        }
+        Ok(domain)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Flow {
         pub flow_id: String,
@@ -248,6 +268,66 @@ pub struct DomainAttribution {
         pub expires_at: Option<TimestampMs>,
 }
 
+/// A DNS binding that has been resolved to a stable device identity and can be
+/// applied to flows which were persisted before the DNS response arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDomainBinding {
+        pub client_mac: String,
+        pub target_ip: String,
+        pub attribution: DomainAttribution,
+}
+
+/// Counts returned by destructive privacy operations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataDeletionResult {
+        pub devices_deleted: usize,
+        pub flows_deleted: usize,
+        pub flows_redacted: usize,
+        pub device_minutes_deleted: usize,
+        pub domain_minutes_deleted: usize,
+        pub contributions_deleted: usize,
+}
+
+/// Validated half-open deletion interval `[from_ms, to_ms)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataTimeRange {
+        pub from_ms: TimestampMs,
+        pub to_ms: TimestampMs,
+}
+
+impl DataTimeRange {
+        pub fn new(
+                from_ms: Option<TimestampMs>,
+                to_ms: Option<TimestampMs>,
+        ) -> Result<Self, &'static str> {
+                if from_ms.is_none() && to_ms.is_none() {
+                        return Err("at least one time boundary is required");
+                }
+                if from_ms.is_some_and(|value| value < 0) || to_ms.is_some_and(|value| value < 0) {
+                        return Err("time boundaries must not be negative");
+                }
+                let range = Self {
+                        from_ms: from_ms.unwrap_or(0),
+                        to_ms: to_ms.unwrap_or(i64::MAX),
+                };
+                if range.from_ms >= range.to_ms {
+                        return Err("from_ms must be less than to_ms");
+                }
+                Ok(range)
+        }
+}
+
+impl DataDeletionResult {
+        pub fn total_changes(&self) -> usize {
+                self.devices_deleted
+                        .saturating_add(self.flows_deleted)
+                        .saturating_add(self.flows_redacted)
+                        .saturating_add(self.device_minutes_deleted)
+                        .saturating_add(self.domain_minutes_deleted)
+                        .saturating_add(self.contributions_deleted)
+        }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DomainSource {
@@ -456,5 +536,37 @@ mod tests {
                         Some(accepted)
                 );
                 assert!(normalize_display_name(Some(&"测".repeat(129))).is_err());
+        }
+
+        #[test]
+        fn domain_name_normalization_is_strict_and_canonical() {
+                assert_eq!(
+                        normalize_domain_name(" Example.COM. ").unwrap(),
+                        "example.com"
+                );
+                for invalid in ["", "..", "-bad.example", "bad-.example", "bad/name"] {
+                        assert!(normalize_domain_name(invalid).is_err());
+                }
+        }
+
+        #[test]
+        fn deletion_time_range_applies_defaults_and_rejects_invalid_bounds() {
+                assert_eq!(
+                        DataTimeRange::new(None, Some(100)).unwrap(),
+                        DataTimeRange {
+                                from_ms: 0,
+                                to_ms: 100,
+                        }
+                );
+                assert_eq!(
+                        DataTimeRange::new(Some(100), None).unwrap(),
+                        DataTimeRange {
+                                from_ms: 100,
+                                to_ms: i64::MAX,
+                        }
+                );
+                assert!(DataTimeRange::new(None, None).is_err());
+                assert!(DataTimeRange::new(Some(-1), Some(10)).is_err());
+                assert!(DataTimeRange::new(Some(10), Some(10)).is_err());
         }
 }

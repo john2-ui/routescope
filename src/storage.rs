@@ -1,9 +1,10 @@
 //! SQLite persistence: schema, repository, and retention cleanup.
 
 use crate::domain::{
-        ConnectionState, Device, DeviceFlowSummary, DeviceMinuteStat, DomainAttribution,
-        DomainConfidence, DomainMinuteStat, DomainSource, DomainTrafficSummary, Flow, FlowCounters,
-        FlowDirection, FlowPageAnchor, FlowPageDirection, floor_to_minute_ms,
+        ConnectionState, DataDeletionResult, Device, DeviceFlowSummary, DeviceMinuteStat,
+        DomainAttribution, DomainConfidence, DomainMinuteStat, DomainSource, DomainTrafficSummary,
+        Flow, FlowCounters, FlowDirection, FlowPageAnchor, FlowPageDirection,
+        ResolvedDomainBinding, floor_to_minute_ms,
 };
 use rusqlite::{
         Connection, OptionalExtension, Params, Result as SqliteResult, Row, Statement, Transaction,
@@ -11,7 +12,7 @@ use rusqlite::{
 };
 use std::{io, sync::Mutex, time::Duration};
 
-const CURRENT_SCHEMA_VERSION: i32 = 2;
+const CURRENT_SCHEMA_VERSION: i32 = 3;
 
 const FLOW_SELECT: &str = r#"
         SELECT
@@ -38,6 +39,22 @@ pub trait RouteScopeRepository: Send + Sync {
         fn upsert_flow(&self, flow: &Flow) -> SqliteResult<()>;
         /// 在一个 SQLite 事务中批量写入/更新 flow。
         fn upsert_flows(&self, flows: &[Flow]) -> SqliteResult<usize>;
+        /// Apply newly resolved MAC-scoped DNS bindings to already persisted flows.
+        fn backfill_domain_bindings(
+                &self,
+                bindings: &[ResolvedDomainBinding],
+        ) -> SqliteResult<usize>;
+        /// Hard-delete a device and all of its persisted observation data.
+        fn delete_device_data(&self, mac_address: &str)
+        -> SqliteResult<Option<DataDeletionResult>>;
+        /// Remove one domain attribution globally or from a single device.
+        fn delete_domain_data(
+                &self,
+                mac_address: Option<&str>,
+                domain: &str,
+        ) -> SqliteResult<DataDeletionResult>;
+        /// Delete persisted observations in the half-open range `[from_ms, to_ms)`.
+        fn delete_data_range(&self, from_ms: i64, to_ms: i64) -> SqliteResult<DataDeletionResult>;
         /// 列出全部设备。
         fn list_devices(&self) -> SqliteResult<Vec<Device>>;
         /// 按 MAC 查询单个设备。
@@ -205,6 +222,28 @@ impl SqliteRepository {
             DROP INDEX IF EXISTS idx_flows_client_mac_last_seen;
             CREATE INDEX IF NOT EXISTS idx_flows_client_mac_last_seen_flow_id
                 ON flows(client_mac, last_seen DESC, flow_id DESC);
+            "#,
+                        )?;
+                }
+                if version < 3 {
+                        tx.execute_batch(
+                                r#"
+            CREATE TABLE IF NOT EXISTS flow_minute_contributions (
+                flow_id          TEXT NOT NULL,
+                mac_address      TEXT NOT NULL,
+                minute_ms        INTEGER NOT NULL,
+                upload_bytes     INTEGER NOT NULL,
+                download_bytes   INTEGER NOT NULL,
+                domain           TEXT,
+                domain_source    TEXT,
+                confidence       TEXT,
+                associated_at    INTEGER,
+                expires_at       INTEGER,
+                PRIMARY KEY (flow_id, minute_ms),
+                FOREIGN KEY (flow_id) REFERENCES flows(flow_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_flow_minute_contributions_minute
+                ON flow_minute_contributions(minute_ms);
             "#,
                         )?;
                 }
@@ -382,6 +421,330 @@ fn add_domain_minute_bytes(
         Ok(())
 }
 
+/// Remove a contribution previously charged to a domain minute bucket.
+fn subtract_domain_minute_bytes(
+        tx: &Transaction<'_>,
+        mac_address: &str,
+        domain: &str,
+        minute_ms: i64,
+        upload_bytes: u64,
+        download_bytes: u64,
+) -> SqliteResult<()> {
+        let upload_bytes = counter_to_sqlite_integer(upload_bytes, "upload_bytes")?;
+        let download_bytes = counter_to_sqlite_integer(download_bytes, "download_bytes")?;
+        let updated = tx.execute(
+                r#"
+        UPDATE domain_minute_stats
+        SET upload_bytes = upload_bytes - ?4,
+            download_bytes = download_bytes - ?5
+        WHERE mac_address = ?1 AND domain = ?2 AND minute_ms = ?3
+          AND upload_bytes >= ?4 AND download_bytes >= ?5
+        "#,
+                params![mac_address, domain, minute_ms, upload_bytes, download_bytes],
+        )?;
+        if updated != 1 {
+                return Err(invalid_counter_error(format!(
+                        "domain contribution exceeds aggregate for {mac_address}/{domain}/{minute_ms}"
+                )));
+        }
+        tx.execute(
+                r#"
+        DELETE FROM domain_minute_stats
+        WHERE mac_address = ?1 AND domain = ?2 AND minute_ms = ?3
+          AND upload_bytes = 0 AND download_bytes = 0
+        "#,
+                params![mac_address, domain, minute_ms],
+        )?;
+        Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct StoredFlowState {
+        counters: FlowCounters,
+        last_seen: i64,
+        domain: Option<DomainAttribution>,
+}
+
+fn attribution_from_columns(
+        domain: Option<String>,
+        source: Option<String>,
+        confidence: Option<String>,
+        associated_at: Option<i64>,
+        expires_at: Option<i64>,
+) -> Option<DomainAttribution> {
+        Some(DomainAttribution {
+                domain: domain?,
+                source: DomainSource::parse(source.as_deref().unwrap_or("unknown"))
+                        .unwrap_or(DomainSource::Unknown),
+                confidence: DomainConfidence::parse(confidence.as_deref().unwrap_or("unknown"))
+                        .unwrap_or(DomainConfidence::Unknown),
+                associated_at: associated_at.unwrap_or(0),
+                expires_at,
+        })
+}
+
+fn confidence_rank(confidence: &DomainConfidence) -> u8 {
+        match confidence {
+                DomainConfidence::High => 2,
+                DomainConfidence::Low => 1,
+                DomainConfidence::Unknown => 0,
+        }
+}
+
+fn source_rank(source: &DomainSource) -> u8 {
+        match source {
+                DomainSource::Dns => 2,
+                DomainSource::Sni => 1,
+                DomainSource::Unknown => 0,
+        }
+}
+
+/// Keep a persisted high-confidence attribution when a later collector snapshot
+/// has no domain or only a weaker hint.
+fn effective_attribution(
+        stored: Option<&DomainAttribution>,
+        incoming: Option<&DomainAttribution>,
+) -> Option<DomainAttribution> {
+        match (stored, incoming) {
+                (None, None) => None,
+                (Some(stored), None) => Some(stored.clone()),
+                (None, Some(incoming)) => Some(incoming.clone()),
+                (Some(stored), Some(incoming)) => {
+                        let stored_rank = (
+                                confidence_rank(&stored.confidence),
+                                source_rank(&stored.source),
+                        );
+                        let incoming_rank = (
+                                confidence_rank(&incoming.confidence),
+                                source_rank(&incoming.source),
+                        );
+                        if incoming_rank > stored_rank
+                                || (incoming_rank == stored_rank
+                                        && incoming.associated_at >= stored.associated_at)
+                        {
+                                Some(incoming.clone())
+                        } else {
+                                Some(stored.clone())
+                        }
+                }
+        }
+}
+
+fn load_stored_flow_state(
+        tx: &Transaction<'_>,
+        flow_id: &str,
+) -> SqliteResult<Option<StoredFlowState>> {
+        tx.query_row(
+                r#"
+        SELECT upload_bytes, download_bytes, packet_count, last_seen,
+               domain, domain_source, domain_confidence,
+               domain_associated_at, domain_expires_at
+        FROM flows WHERE flow_id = ?1
+        "#,
+                params![flow_id],
+                |row| {
+                        Ok(StoredFlowState {
+                                counters: FlowCounters {
+                                        upload_bytes: counter_from_sqlite_integer(
+                                                row.get(0)?,
+                                                "upload_bytes",
+                                        )?,
+                                        download_bytes: counter_from_sqlite_integer(
+                                                row.get(1)?,
+                                                "download_bytes",
+                                        )?,
+                                        packet_count: counter_from_sqlite_integer(
+                                                row.get(2)?,
+                                                "packet_count",
+                                        )?,
+                                },
+                                last_seen: row.get(3)?,
+                                domain: attribution_from_columns(
+                                        row.get(4)?,
+                                        row.get(5)?,
+                                        row.get(6)?,
+                                        row.get(7)?,
+                                        row.get(8)?,
+                                ),
+                        })
+                },
+        )
+        .optional()
+}
+
+fn add_flow_minute_contribution(
+        tx: &Transaction<'_>,
+        flow_id: &str,
+        mac_address: &str,
+        minute_ms: i64,
+        upload_bytes: u64,
+        download_bytes: u64,
+        attribution: Option<&DomainAttribution>,
+) -> SqliteResult<()> {
+        let upload_bytes = counter_to_sqlite_integer(upload_bytes, "upload_bytes")?;
+        let download_bytes = counter_to_sqlite_integer(download_bytes, "download_bytes")?;
+        let (domain, source, confidence, associated_at, expires_at) = match attribution {
+                Some(attribution) => (
+                        Some(attribution.domain.as_str()),
+                        Some(attribution.source.as_str()),
+                        Some(attribution.confidence.as_str()),
+                        Some(attribution.associated_at),
+                        attribution.expires_at,
+                ),
+                None => (None, None, None, None, None),
+        };
+        tx.execute(
+                r#"
+        INSERT INTO flow_minute_contributions
+            (flow_id, mac_address, minute_ms, upload_bytes, download_bytes,
+             domain, domain_source, confidence, associated_at, expires_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(flow_id, minute_ms) DO UPDATE SET
+            upload_bytes = upload_bytes + excluded.upload_bytes,
+            download_bytes = download_bytes + excluded.download_bytes,
+            domain = excluded.domain,
+            domain_source = excluded.domain_source,
+            confidence = excluded.confidence,
+            associated_at = excluded.associated_at,
+            expires_at = excluded.expires_at
+        "#,
+                params![
+                        flow_id,
+                        mac_address,
+                        minute_ms,
+                        upload_bytes,
+                        download_bytes,
+                        domain,
+                        source,
+                        confidence,
+                        associated_at,
+                        expires_at
+                ],
+        )?;
+        Ok(())
+}
+
+/// v2 did not have a contribution ledger. Lazily create a baseline only for an
+/// unattributed legacy flow; this enables useful backfill without rewriting old
+/// attributed trend buckets.
+fn ensure_legacy_unattributed_baseline(
+        tx: &Transaction<'_>,
+        flow_id: &str,
+        mac_address: &str,
+        state: &StoredFlowState,
+) -> SqliteResult<()> {
+        if state.domain.is_some()
+                || (state.counters.upload_bytes == 0 && state.counters.download_bytes == 0)
+        {
+                return Ok(());
+        }
+        let exists = tx
+                .prepare("SELECT 1 FROM flow_minute_contributions WHERE flow_id = ?1 LIMIT 1")?
+                .exists(params![flow_id])?;
+        if !exists {
+                add_flow_minute_contribution(
+                        tx,
+                        flow_id,
+                        mac_address,
+                        floor_to_minute_ms(state.last_seen),
+                        state.counters.upload_bytes,
+                        state.counters.download_bytes,
+                        None,
+                )?;
+        }
+        Ok(())
+}
+
+fn reconcile_flow_contributions(
+        tx: &Transaction<'_>,
+        flow_id: &str,
+        mac_address: &str,
+        attribution: &DomainAttribution,
+) -> SqliteResult<()> {
+        let contributions = {
+                let mut stmt = tx.prepare(
+                        r#"
+            SELECT minute_ms, upload_bytes, download_bytes,
+                   domain, domain_source, confidence, associated_at, expires_at
+            FROM flow_minute_contributions
+            WHERE flow_id = ?1
+            "#,
+                )?;
+                stmt.query_map(params![flow_id], |row| {
+                        Ok((
+                                row.get::<_, i64>(0)?,
+                                counter_from_sqlite_integer(row.get(1)?, "upload_bytes")?,
+                                counter_from_sqlite_integer(row.get(2)?, "download_bytes")?,
+                                attribution_from_columns(
+                                        row.get(3)?,
+                                        row.get(4)?,
+                                        row.get(5)?,
+                                        row.get(6)?,
+                                        row.get(7)?,
+                                ),
+                        ))
+                })?
+                .collect::<SqliteResult<Vec<_>>>()?
+        };
+
+        for (minute_ms, upload_bytes, download_bytes, previous) in contributions {
+                if previous.as_ref().map(|value| value.domain.as_str())
+                        != Some(attribution.domain.as_str())
+                {
+                        if let Some(previous) = previous {
+                                subtract_domain_minute_bytes(
+                                        tx,
+                                        mac_address,
+                                        &previous.domain,
+                                        minute_ms,
+                                        upload_bytes,
+                                        download_bytes,
+                                )?;
+                        }
+                        add_domain_minute_bytes(
+                                tx,
+                                mac_address,
+                                attribution,
+                                minute_ms,
+                                upload_bytes,
+                                download_bytes,
+                        )?;
+                } else {
+                        tx.execute(
+                                r#"
+                    UPDATE domain_minute_stats
+                    SET domain_source = ?4, confidence = ?5
+                    WHERE mac_address = ?1 AND domain = ?2 AND minute_ms = ?3
+                    "#,
+                                params![
+                                        mac_address,
+                                        attribution.domain,
+                                        minute_ms,
+                                        attribution.source.as_str(),
+                                        attribution.confidence.as_str()
+                                ],
+                        )?;
+                }
+        }
+        tx.execute(
+                r#"
+        UPDATE flow_minute_contributions
+        SET domain = ?2, domain_source = ?3, confidence = ?4,
+            associated_at = ?5, expires_at = ?6
+        WHERE flow_id = ?1
+        "#,
+                params![
+                        flow_id,
+                        attribution.domain,
+                        attribution.source.as_str(),
+                        attribution.confidence.as_str(),
+                        attribution.associated_at,
+                        attribution.expires_at
+                ],
+        )?;
+        Ok(())
+}
+
 /// 构造计数非法相关的 rusqlite 错误。
 fn invalid_counter_error(message: impl Into<String>) -> rusqlite::Error {
         rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
@@ -435,8 +798,13 @@ fn upsert_flow_tx(tx: &Transaction<'_>, flow: &Flow) -> SqliteResult<()> {
                 },
         )?;
 
+        let previous = load_stored_flow_state(tx, &flow.flow_id)?;
+        let attribution = effective_attribution(
+                previous.as_ref().and_then(|state| state.domain.as_ref()),
+                flow.domain.as_ref(),
+        );
         let (domain, domain_source, domain_confidence, domain_associated_at, domain_expires_at) =
-                match &flow.domain {
+                match attribution.as_ref() {
                         Some(d) => (
                                 Some(d.domain.as_str()),
                                 Some(d.source.as_str()),
@@ -447,36 +815,22 @@ fn upsert_flow_tx(tx: &Transaction<'_>, flow: &Flow) -> SqliteResult<()> {
                         None => (None, None, None, None, None),
                 };
 
-        let previous: Option<FlowCounters> = tx
-                .query_row(
-                        "SELECT upload_bytes, download_bytes, packet_count
-             FROM flows WHERE flow_id = ?1",
-                        params![flow.flow_id],
-                        |row| {
-                                Ok(FlowCounters {
-                                        upload_bytes: counter_from_sqlite_integer(
-                                                row.get(0)?,
-                                                "upload_bytes",
-                                        )?,
-                                        download_bytes: counter_from_sqlite_integer(
-                                                row.get(1)?,
-                                                "download_bytes",
-                                        )?,
-                                        packet_count: counter_from_sqlite_integer(
-                                                row.get(2)?,
-                                                "packet_count",
-                                        )?,
-                                })
-                        },
-                )
-                .optional()?;
-
-        let delta = match previous {
-                Some(previous) => current_counters.delta_from(previous).map_err(|reset| {
-                        invalid_counter_error(format!("flow {}: {reset}", flow.flow_id))
-                })?,
-                None => current_counters,
+        let delta = match previous.as_ref() {
+                Some(previous) => current_counters
+                        .clone()
+                        .delta_from(previous.counters.clone())
+                        .map_err(|reset| {
+                                invalid_counter_error(format!("flow {}: {reset}", flow.flow_id))
+                        })?,
+                None => current_counters.clone(),
         };
+
+        if let (Some(previous), Some(attribution)) = (previous.as_ref(), attribution.as_ref())
+                && previous.domain.as_ref() != Some(attribution)
+        {
+                ensure_legacy_unattributed_baseline(tx, &flow.flow_id, &flow.client_mac, previous)?;
+                reconcile_flow_contributions(tx, &flow.flow_id, &flow.client_mac, attribution)?;
+        }
 
         tx.execute(
                 r#"
@@ -563,7 +917,16 @@ fn upsert_flow_tx(tx: &Transaction<'_>, flow: &Flow) -> SqliteResult<()> {
                         delta.upload_bytes,
                         delta.download_bytes,
                 )?;
-                if let Some(attribution) = &flow.domain {
+                add_flow_minute_contribution(
+                        tx,
+                        &flow.flow_id,
+                        &flow.client_mac,
+                        minute_ms,
+                        delta.upload_bytes,
+                        delta.download_bytes,
+                        attribution.as_ref(),
+                )?;
+                if let Some(attribution) = attribution.as_ref() {
                         add_domain_minute_bytes(
                                 tx,
                                 &flow.client_mac,
@@ -576,6 +939,233 @@ fn upsert_flow_tx(tx: &Transaction<'_>, flow: &Flow) -> SqliteResult<()> {
         }
 
         Ok(())
+}
+
+fn backfill_domain_binding_tx(
+        tx: &Transaction<'_>,
+        binding: &ResolvedDomainBinding,
+) -> SqliteResult<usize> {
+        let expires_at = binding.attribution.expires_at.unwrap_or(i64::MAX);
+        let flow_ids = {
+                let mut stmt = tx.prepare(
+                        r#"
+            SELECT flow_id
+            FROM flows
+            WHERE client_mac = ?1 AND destination_ip = ?2
+              AND last_seen >= ?3 AND first_seen < ?4
+            "#,
+                )?;
+                stmt.query_map(
+                        params![
+                                binding.client_mac,
+                                binding.target_ip,
+                                binding.attribution.associated_at,
+                                expires_at
+                        ],
+                        |row| row.get::<_, String>(0),
+                )?
+                .collect::<SqliteResult<Vec<_>>>()?
+        };
+
+        let mut updated = 0;
+        for flow_id in flow_ids {
+                let Some(state) = load_stored_flow_state(tx, &flow_id)? else {
+                        continue;
+                };
+                let effective =
+                        effective_attribution(state.domain.as_ref(), Some(&binding.attribution));
+                if effective.as_ref() == state.domain.as_ref() {
+                        continue;
+                }
+                let Some(effective) = effective else {
+                        continue;
+                };
+
+                ensure_legacy_unattributed_baseline(tx, &flow_id, &binding.client_mac, &state)?;
+                reconcile_flow_contributions(tx, &flow_id, &binding.client_mac, &effective)?;
+                tx.execute(
+                        r#"
+            UPDATE flows
+            SET domain = ?2, domain_source = ?3, domain_confidence = ?4,
+                domain_associated_at = ?5, domain_expires_at = ?6
+            WHERE flow_id = ?1
+            "#,
+                        params![
+                                flow_id,
+                                effective.domain,
+                                effective.source.as_str(),
+                                effective.confidence.as_str(),
+                                effective.associated_at,
+                                effective.expires_at
+                        ],
+                )?;
+                updated += 1;
+        }
+        Ok(updated)
+}
+
+fn count_rows<P: Params>(tx: &Transaction<'_>, sql: &str, params: P) -> SqliteResult<usize> {
+        let count = tx.query_row(sql, params, |row| row.get::<_, i64>(0))?;
+        usize::try_from(count).map_err(|_| invalid_counter_error("row count must be non-negative"))
+}
+
+fn delete_device_data_tx(
+        tx: &Transaction<'_>,
+        mac_address: &str,
+) -> SqliteResult<Option<DataDeletionResult>> {
+        let exists = tx
+                .prepare("SELECT 1 FROM devices WHERE mac_address = ?1")?
+                .exists(params![mac_address])?;
+        if !exists {
+                return Ok(None);
+        }
+
+        let mut result = DataDeletionResult {
+                devices_deleted: 1,
+                flows_deleted: count_rows(
+                        tx,
+                        "SELECT COUNT(*) FROM flows WHERE client_mac = ?1",
+                        params![mac_address],
+                )?,
+                contributions_deleted: count_rows(
+                        tx,
+                        "SELECT COUNT(*) FROM flow_minute_contributions WHERE mac_address = ?1",
+                        params![mac_address],
+                )?,
+                ..DataDeletionResult::default()
+        };
+        result.device_minutes_deleted = tx.execute(
+                "DELETE FROM device_minute_stats WHERE mac_address = ?1",
+                params![mac_address],
+        )?;
+        result.domain_minutes_deleted = tx.execute(
+                "DELETE FROM domain_minute_stats WHERE mac_address = ?1",
+                params![mac_address],
+        )?;
+        tx.execute(
+                "DELETE FROM flows WHERE client_mac = ?1",
+                params![mac_address],
+        )?;
+        tx.execute(
+                "DELETE FROM devices WHERE mac_address = ?1",
+                params![mac_address],
+        )?;
+        Ok(Some(result))
+}
+
+fn delete_domain_data_tx(
+        tx: &Transaction<'_>,
+        mac_address: Option<&str>,
+        domain: &str,
+) -> SqliteResult<DataDeletionResult> {
+        let mut result = DataDeletionResult::default();
+        match mac_address {
+                Some(mac_address) => {
+                        result.contributions_deleted = tx.execute(
+                                r#"
+                    DELETE FROM flow_minute_contributions
+                    WHERE mac_address = ?1 AND domain = ?2
+                    "#,
+                                params![mac_address, domain],
+                        )?;
+                        result.domain_minutes_deleted = tx.execute(
+                                r#"
+                    DELETE FROM domain_minute_stats
+                    WHERE mac_address = ?1 AND domain = ?2
+                    "#,
+                                params![mac_address, domain],
+                        )?;
+                        result.flows_redacted = tx.execute(
+                                r#"
+                    UPDATE flows
+                    SET domain = NULL, domain_source = NULL, domain_confidence = NULL,
+                        domain_associated_at = NULL, domain_expires_at = NULL
+                    WHERE client_mac = ?1 AND domain = ?2
+                    "#,
+                                params![mac_address, domain],
+                        )?;
+                }
+                None => {
+                        result.contributions_deleted = tx.execute(
+                                "DELETE FROM flow_minute_contributions WHERE domain = ?1",
+                                params![domain],
+                        )?;
+                        result.domain_minutes_deleted = tx.execute(
+                                "DELETE FROM domain_minute_stats WHERE domain = ?1",
+                                params![domain],
+                        )?;
+                        result.flows_redacted = tx.execute(
+                                r#"
+                    UPDATE flows
+                    SET domain = NULL, domain_source = NULL, domain_confidence = NULL,
+                        domain_associated_at = NULL, domain_expires_at = NULL
+                    WHERE domain = ?1
+                    "#,
+                                params![domain],
+                        )?;
+                }
+        }
+        Ok(result)
+}
+
+fn delete_data_range_tx(
+        tx: &Transaction<'_>,
+        from_ms: i64,
+        to_ms: i64,
+) -> SqliteResult<DataDeletionResult> {
+        let flow_overlap = "first_seen < ?2 AND last_seen >= ?1";
+        let contributions_deleted = count_rows(
+                tx,
+                &format!(r#"
+            SELECT COUNT(*)
+            FROM flow_minute_contributions c
+            WHERE (c.minute_ms >= ?1 AND c.minute_ms < ?2)
+               OR EXISTS (
+                    SELECT 1 FROM flows f
+                    WHERE f.flow_id = c.flow_id AND {flow_overlap}
+               )
+            "#),
+                params![from_ms, to_ms],
+        )?;
+        let flows_deleted = count_rows(
+                tx,
+                &format!("SELECT COUNT(*) FROM flows WHERE {flow_overlap}"),
+                params![from_ms, to_ms],
+        )?;
+
+        let device_minutes_deleted = tx.execute(
+                r#"
+            DELETE FROM device_minute_stats
+            WHERE minute_ms >= ?1 AND minute_ms < ?2
+            "#,
+                params![from_ms, to_ms],
+        )?;
+        let domain_minutes_deleted = tx.execute(
+                r#"
+            DELETE FROM domain_minute_stats
+            WHERE minute_ms >= ?1 AND minute_ms < ?2
+            "#,
+                params![from_ms, to_ms],
+        )?;
+        tx.execute(
+                r#"
+            DELETE FROM flow_minute_contributions
+            WHERE minute_ms >= ?1 AND minute_ms < ?2
+            "#,
+                params![from_ms, to_ms],
+        )?;
+        tx.execute(
+                &format!("DELETE FROM flows WHERE {flow_overlap}"),
+                params![from_ms, to_ms],
+        )?;
+
+        Ok(DataDeletionResult {
+                flows_deleted,
+                device_minutes_deleted,
+                domain_minutes_deleted,
+                contributions_deleted,
+                ..DataDeletionResult::default()
+        })
 }
 
 impl RouteScopeRepository for SqliteRepository {
@@ -620,6 +1210,54 @@ impl RouteScopeRepository for SqliteRepository {
                 }
                 tx.commit()?;
                 Ok(flows.len())
+        }
+
+        fn backfill_domain_bindings(
+                &self,
+                bindings: &[ResolvedDomainBinding],
+        ) -> SqliteResult<usize> {
+                if bindings.is_empty() {
+                        return Ok(0);
+                }
+                let mut conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+                let tx = conn.transaction()?;
+                let mut updated = 0;
+                for binding in bindings {
+                        updated += backfill_domain_binding_tx(&tx, binding)?;
+                }
+                tx.commit()?;
+                Ok(updated)
+        }
+
+        fn delete_device_data(
+                &self,
+                mac_address: &str,
+        ) -> SqliteResult<Option<DataDeletionResult>> {
+                let mut conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+                let tx = conn.transaction()?;
+                let result = delete_device_data_tx(&tx, mac_address)?;
+                tx.commit()?;
+                Ok(result)
+        }
+
+        fn delete_domain_data(
+                &self,
+                mac_address: Option<&str>,
+                domain: &str,
+        ) -> SqliteResult<DataDeletionResult> {
+                let mut conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+                let tx = conn.transaction()?;
+                let result = delete_domain_data_tx(&tx, mac_address, domain)?;
+                tx.commit()?;
+                Ok(result)
+        }
+
+        fn delete_data_range(&self, from_ms: i64, to_ms: i64) -> SqliteResult<DataDeletionResult> {
+                let mut conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+                let tx = conn.transaction()?;
+                let result = delete_data_range_tx(&tx, from_ms, to_ms)?;
+                tx.commit()?;
+                Ok(result)
         }
 
         /// 列出全部设备（按 MAC 排序）。
@@ -915,6 +1553,10 @@ impl RouteScopeRepository for SqliteRepository {
                         "DELETE FROM device_minute_stats WHERE minute_ms < ?1",
                         params![agg_cutoff],
                 )?;
+                conn.execute(
+                        "DELETE FROM flow_minute_contributions WHERE minute_ms < ?1",
+                        params![agg_cutoff],
+                )?;
                 let deleted_domain_stats = conn.execute(
                         "DELETE FROM domain_minute_stats WHERE minute_ms < ?1",
                         params![agg_cutoff],
@@ -1021,7 +1663,7 @@ mod tests {
                 let version: i32 = conn
                         .pragma_query_value(None, "user_version", |row| row.get(0))
                         .unwrap();
-                assert_eq!(version, 2);
+                assert_eq!(version, CURRENT_SCHEMA_VERSION);
                 let old_exists = conn
                         .prepare(
                                 "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = \
@@ -1040,6 +1682,15 @@ mod tests {
                         .unwrap();
                 assert!(!old_exists);
                 assert!(new_sql.contains("client_mac, last_seen DESC, flow_id DESC"));
+                let contributions_exist = conn
+                        .prepare(
+                                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
+                                 'flow_minute_contributions'",
+                        )
+                        .unwrap()
+                        .exists([])
+                        .unwrap();
+                assert!(contributions_exist);
         }
 
         #[test]
@@ -1411,6 +2062,328 @@ mod tests {
                 assert_eq!(stats.len(), 1);
                 assert_eq!(stats[0].upload_bytes, flow.upload_bytes);
                 assert_eq!(stats[0].download_bytes, flow.download_bytes);
+        }
+
+        #[test]
+        fn delayed_dns_binding_backfills_each_recorded_minute_once() {
+                let repo = SqliteRepository::open_in_memory().unwrap();
+                let mac = "aa:bb:cc:dd:ee:ff";
+                let mut flow = sample_flow("flow-delayed-domain", mac, 65_000);
+                flow.first_seen = 60_000;
+                flow.upload_bytes = 100;
+                flow.download_bytes = 200;
+                flow.packet_count = 3;
+                flow.domain = None;
+                repo.upsert_flow(&flow).unwrap();
+
+                flow.last_seen = 125_000;
+                flow.upload_bytes = 150;
+                flow.download_bytes = 260;
+                flow.packet_count = 5;
+                repo.upsert_flow(&flow).unwrap();
+
+                let binding = ResolvedDomainBinding {
+                        client_mac: mac.to_owned(),
+                        target_ip: flow.destination_ip.clone(),
+                        attribution: DomainAttribution {
+                                domain: "late.example".to_owned(),
+                                source: DomainSource::Dns,
+                                confidence: DomainConfidence::High,
+                                associated_at: 62_000,
+                                expires_at: Some(180_000),
+                        },
+                };
+
+                assert_eq!(
+                        repo.backfill_domain_bindings(std::slice::from_ref(&binding))
+                                .unwrap(),
+                        1
+                );
+                assert_eq!(
+                        repo.backfill_domain_bindings(std::slice::from_ref(&binding))
+                                .unwrap(),
+                        0
+                );
+
+                let stats = repo
+                        .list_domain_minute_stats(mac, "late.example", 0)
+                        .unwrap();
+                assert_eq!(stats.len(), 2);
+                assert_eq!(
+                        (
+                                stats[0].minute_ms,
+                                stats[0].upload_bytes,
+                                stats[0].download_bytes
+                        ),
+                        (60_000, 100, 200)
+                );
+                assert_eq!(
+                        (
+                                stats[1].minute_ms,
+                                stats[1].upload_bytes,
+                                stats[1].download_bytes
+                        ),
+                        (120_000, 50, 60)
+                );
+                let stored = all_flows(&repo, mac);
+                assert_eq!(stored[0].domain.as_ref().unwrap().domain, "late.example");
+
+                let device_stats = repo.list_device_minute_stats(mac, 0).unwrap();
+                assert_eq!(device_stats[0].upload_bytes, 100);
+                assert_eq!(device_stats[1].upload_bytes, 50);
+        }
+
+        #[test]
+        fn delayed_dns_binding_reassigns_low_confidence_sni_aggregate() {
+                let repo = SqliteRepository::open_in_memory().unwrap();
+                let mac = "aa:bb:cc:dd:ee:ff";
+                let mut flow = sample_flow("flow-sni-backfill", mac, 125_000);
+                flow.first_seen = 120_000;
+                flow.upload_bytes = 400;
+                flow.download_bytes = 600;
+                flow.domain = Some(DomainAttribution {
+                        domain: "cdn-guess.example".to_owned(),
+                        source: DomainSource::Sni,
+                        confidence: DomainConfidence::Low,
+                        associated_at: 120_000,
+                        expires_at: None,
+                });
+                repo.upsert_flow(&flow).unwrap();
+
+                let binding = ResolvedDomainBinding {
+                        client_mac: mac.to_owned(),
+                        target_ip: flow.destination_ip.clone(),
+                        attribution: DomainAttribution {
+                                domain: "exact.example".to_owned(),
+                                source: DomainSource::Dns,
+                                confidence: DomainConfidence::High,
+                                associated_at: 121_000,
+                                expires_at: Some(180_000),
+                        },
+                };
+                assert_eq!(repo.backfill_domain_bindings(&[binding]).unwrap(), 1);
+
+                assert!(repo
+                        .list_domain_minute_stats(mac, "cdn-guess.example", 0)
+                        .unwrap()
+                        .is_empty());
+                let exact = repo
+                        .list_domain_minute_stats(mac, "exact.example", 0)
+                        .unwrap();
+                assert_eq!(exact.len(), 1);
+                assert_eq!(exact[0].upload_bytes, 400);
+                assert_eq!(exact[0].download_bytes, 600);
+                assert_eq!(exact[0].source, DomainSource::Dns);
+                assert_eq!(exact[0].confidence, DomainConfidence::High);
+        }
+
+        #[test]
+        fn delayed_dns_binding_respects_device_target_and_time_interval() {
+                let repo = SqliteRepository::open_in_memory().unwrap();
+                let mac = "aa:bb:cc:dd:ee:ff";
+                let mut matching = sample_flow("matching", mac, 125_000);
+                matching.first_seen = 120_000;
+                matching.domain = None;
+                let mut old = sample_flow("old", mac, 100_000);
+                old.first_seen = 90_000;
+                old.domain = None;
+                let mut other_device = sample_flow("other-device", "00:00:00:00:00:01", 125_000);
+                other_device.first_seen = 120_000;
+                other_device.domain = None;
+                let mut other_target = sample_flow("other-target", mac, 125_000);
+                other_target.first_seen = 120_000;
+                other_target.destination_ip = "203.0.113.99".to_owned();
+                other_target.domain = None;
+                repo.upsert_flows(&[matching, old, other_device, other_target])
+                        .unwrap();
+
+                let binding = ResolvedDomainBinding {
+                        client_mac: mac.to_owned(),
+                        target_ip: "93.184.216.34".to_owned(),
+                        attribution: DomainAttribution {
+                                domain: "isolated.example".to_owned(),
+                                source: DomainSource::Dns,
+                                confidence: DomainConfidence::High,
+                                associated_at: 110_000,
+                                expires_at: Some(180_000),
+                        },
+                };
+                assert_eq!(repo.backfill_domain_bindings(&[binding]).unwrap(), 1);
+
+                let attributed = all_flows(&repo, mac)
+                        .into_iter()
+                        .filter(|flow| flow.domain.is_some())
+                        .map(|flow| flow.flow_id)
+                        .collect::<Vec<_>>();
+                assert_eq!(attributed, ["matching"]);
+                assert!(all_flows(&repo, "00:00:00:00:00:01")[0].domain.is_none());
+        }
+
+        #[test]
+        fn repeated_snapshot_without_domain_preserves_persisted_dns_attribution() {
+                let repo = SqliteRepository::open_in_memory().unwrap();
+                let mac = "aa:bb:cc:dd:ee:ff";
+                let mut flow = sample_flow("flow-domain-preserved", mac, 125_000);
+                repo.upsert_flow(&flow).unwrap();
+
+                flow.domain = None;
+                flow.upload_bytes += 10;
+                flow.download_bytes += 20;
+                repo.upsert_flow(&flow).unwrap();
+
+                let stored = all_flows(&repo, mac);
+                assert_eq!(stored[0].domain.as_ref().unwrap().domain, "example.com");
+                let stats = repo
+                        .list_domain_minute_stats(mac, "example.com", 0)
+                        .unwrap();
+                assert_eq!(stats[0].upload_bytes, flow.upload_bytes);
+                assert_eq!(stats[0].download_bytes, flow.download_bytes);
+        }
+
+        #[test]
+        fn device_data_deletion_is_isolated_and_keeps_admin_account() {
+                let repo = SqliteRepository::open_in_memory().unwrap();
+                let selected = "aa:bb:cc:dd:ee:ff";
+                let other = "00:00:00:00:00:01";
+                repo.insert_local_account_if_missing("admin", "hash")
+                        .unwrap();
+                repo.upsert_flow(&sample_flow("delete-device", selected, 125_000))
+                        .unwrap();
+                repo.upsert_flow(&sample_flow("keep-device", other, 125_000))
+                        .unwrap();
+
+                let result = repo.delete_device_data(selected).unwrap().unwrap();
+                assert_eq!(result.devices_deleted, 1);
+                assert_eq!(result.flows_deleted, 1);
+                assert_eq!(result.device_minutes_deleted, 1);
+                assert_eq!(result.domain_minutes_deleted, 1);
+                assert_eq!(result.contributions_deleted, 1);
+                assert!(repo.find_device(selected).unwrap().is_none());
+                assert!(all_flows(&repo, selected).is_empty());
+                assert!(repo.find_device(other).unwrap().is_some());
+                assert_eq!(all_flows(&repo, other).len(), 1);
+                assert_eq!(
+                        repo.first_local_account().unwrap(),
+                        Some(("admin".to_owned(), "hash".to_owned()))
+                );
+                assert!(repo.delete_device_data(selected).unwrap().is_none());
+        }
+
+        #[test]
+        fn domain_deletion_redacts_attribution_without_changing_device_totals() {
+                let repo = SqliteRepository::open_in_memory().unwrap();
+                let selected = "aa:bb:cc:dd:ee:ff";
+                let other = "00:00:00:00:00:01";
+                let selected_flow = sample_flow("selected-domain", selected, 125_000);
+                let other_device_flow = sample_flow("other-device-domain", other, 125_000);
+                let mut other_domain_flow = sample_flow("other-domain", selected, 185_000);
+                other_domain_flow.domain.as_mut().unwrap().domain = "other.example".to_owned();
+                repo.upsert_flows(&[selected_flow, other_device_flow, other_domain_flow])
+                        .unwrap();
+                let device_totals = repo.list_device_minute_stats(selected, 0).unwrap();
+
+                let result = repo
+                        .delete_domain_data(Some(selected), "example.com")
+                        .unwrap();
+                assert_eq!(result.flows_redacted, 1);
+                assert_eq!(result.domain_minutes_deleted, 1);
+                assert_eq!(result.contributions_deleted, 1);
+                assert_eq!(
+                        repo.list_device_minute_stats(selected, 0).unwrap(),
+                        device_totals
+                );
+                assert!(repo
+                        .list_domain_minute_stats(selected, "example.com", 0)
+                        .unwrap()
+                        .is_empty());
+                assert_eq!(
+                        all_flows(&repo, selected)
+                                .iter()
+                                .find(|flow| flow.flow_id == "selected-domain")
+                                .unwrap()
+                                .domain,
+                        None
+                );
+                assert!(all_flows(&repo, other)[0].domain.is_some());
+                assert!(all_flows(&repo, selected)
+                        .iter()
+                        .find(|flow| flow.flow_id == "other-domain")
+                        .unwrap()
+                        .domain
+                        .is_some());
+
+                assert_eq!(
+                        repo.delete_domain_data(Some(selected), "example.com")
+                                .unwrap(),
+                        DataDeletionResult::default()
+                );
+                let global = repo.delete_domain_data(None, "example.com").unwrap();
+                assert_eq!(global.flows_redacted, 1);
+                assert!(all_flows(&repo, other)[0].domain.is_none());
+        }
+
+        #[test]
+        fn time_range_deletion_uses_half_open_flow_and_minute_boundaries() {
+                let repo = SqliteRepository::open_in_memory().unwrap();
+                let mac = "aa:bb:cc:dd:ee:ff";
+                let mut before = sample_flow("range-before", mac, 119_999);
+                before.first_seen = 110_000;
+                let mut at_start = sample_flow("range-start", mac, 120_000);
+                at_start.first_seen = 119_000;
+                let mut inside = sample_flow("range-inside", mac, 150_000);
+                inside.first_seen = 140_000;
+                let mut at_end = sample_flow("range-end", mac, 190_000);
+                at_end.first_seen = 180_000;
+                repo.upsert_flows(&[before, at_start, inside, at_end])
+                        .unwrap();
+
+                let result = repo.delete_data_range(120_000, 180_000).unwrap();
+                assert_eq!(result.flows_deleted, 2);
+                assert_eq!(result.device_minutes_deleted, 1);
+                assert_eq!(result.domain_minutes_deleted, 1);
+                assert_eq!(result.contributions_deleted, 2);
+                let remaining = all_flows(&repo, mac)
+                        .into_iter()
+                        .map(|flow| flow.flow_id)
+                        .collect::<Vec<_>>();
+                assert_eq!(remaining, ["range-end", "range-before"]);
+                assert!(repo.find_device(mac).unwrap().is_some());
+                assert_eq!(
+                        repo.delete_data_range(120_000, 180_000).unwrap(),
+                        DataDeletionResult::default()
+                );
+        }
+
+        #[test]
+        fn destructive_deletion_rolls_back_when_a_statement_fails() {
+                let repo = SqliteRepository::open_in_memory().unwrap();
+                let mac = "aa:bb:cc:dd:ee:ff";
+                repo.upsert_flow(&sample_flow("rollback-delete", mac, 125_000))
+                        .unwrap();
+                {
+                        let conn = repo.conn.lock().unwrap();
+                        conn.execute_batch(
+                                r#"
+                    CREATE TRIGGER reject_domain_delete
+                    BEFORE DELETE ON domain_minute_stats
+                    BEGIN
+                        SELECT RAISE(ABORT, 'test deletion failure');
+                    END;
+                    "#,
+                        )
+                        .unwrap();
+                }
+
+                assert!(repo.delete_device_data(mac).is_err());
+                assert!(repo.find_device(mac).unwrap().is_some());
+                assert_eq!(all_flows(&repo, mac).len(), 1);
+                assert_eq!(repo.list_device_minute_stats(mac, 0).unwrap().len(), 1);
+                assert_eq!(
+                        repo.list_domain_minute_stats(mac, "example.com", 0)
+                                .unwrap()
+                                .len(),
+                        1
+                );
         }
 
         #[test]

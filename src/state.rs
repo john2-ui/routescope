@@ -1,5 +1,6 @@
 use crate::auth::AuthService;
 use crate::collector::{CollectorHealth, CollectorHealthState};
+use crate::dns::DnsAttributionCache;
 use crate::service::ObservationService;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -111,6 +112,7 @@ pub struct AppState {
         pub observation: Arc<ObservationService>,
         pub auth: Arc<AuthService>,
         pub collector_health: Arc<CollectorHealthTracker>,
+        pub dns_cache: Arc<DnsAttributionCache>,
         pub dev_bypass_auth: bool,
         pub secure_cookies: bool,
 }

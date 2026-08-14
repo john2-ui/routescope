@@ -4,13 +4,14 @@ use axum::{
         http::{HeaderMap, StatusCode},
         middleware,
         response::IntoResponse,
-        routing::{get, post},
+        routing::{delete, get, post},
 };
 use serde::Deserialize;
 
 use crate::auth;
 use crate::domain::{
-        Device, DeviceMinuteStat, DomainMinuteStat, DomainTrafficSummary, normalize_display_name,
+        DataDeletionResult, DataTimeRange, Device, DeviceMinuteStat, DomainMinuteStat,
+        DomainTrafficSummary, normalize_display_name, normalize_domain_name,
 };
 use crate::service::{FlowPage, FlowQueryError};
 use crate::state::AppState;
@@ -27,6 +28,7 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         Router::new()
                 .route("/api/v1/devices", get(list_devices))
                 .route("/api/v1/devices/{mac_address}", get(device_detail))
+                .route("/api/v1/devices/{mac_address}", delete(delete_device_data))
                 .route("/api/v1/devices/{mac_address}/traffic", get(device_traffic))
                 .route("/api/v1/devices/{mac_address}/flows", get(device_flows))
                 .route("/api/v1/devices/{mac_address}/domains", get(device_domains))
@@ -34,6 +36,15 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
                         "/api/v1/devices/{mac_address}/domains/{domain}/traffic",
                         get(device_domain_traffic),
                 )
+                .route(
+                        "/api/v1/devices/{mac_address}/domains/{domain}",
+                        delete(delete_device_domain_data),
+                )
+                .route(
+                        "/api/v1/domains/{domain}",
+                        delete(delete_global_domain_data),
+                )
+                .route("/api/v1/data", delete(delete_time_range_data))
                 .route(
                         "/api/v1/devices/{mac_address}/name",
                         post(update_device_name),
@@ -217,6 +228,102 @@ async fn update_device_name(
                         Err(StatusCode::INTERNAL_SERVER_ERROR)
                 }
         }
+}
+
+/// Hard-delete a device and every persisted observation associated with it.
+async fn delete_device_data(
+        State(state): State<AppState>,
+        Path(mac_address): Path<String>,
+        headers: HeaderMap,
+) -> Result<Json<DataDeletionResult>, StatusCode> {
+        require_csrf(&state, &headers)?;
+        match state.observation.delete_device_data(&mac_address) {
+                Ok(Some(result)) => {
+                        state.dns_cache.purge_device_data(&mac_address);
+                        Ok(Json(result))
+                }
+                Ok(None) => Err(StatusCode::NOT_FOUND),
+                Err(error) => {
+                        eprintln!("device data deletion failed: {error}");
+                        Err(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+        }
+}
+
+/// Remove one canonical domain from a selected device while retaining traffic totals.
+async fn delete_device_domain_data(
+        State(state): State<AppState>,
+        Path((mac_address, domain)): Path<(String, String)>,
+        headers: HeaderMap,
+) -> Result<Json<DataDeletionResult>, StatusCode> {
+        require_csrf(&state, &headers)?;
+        require_device(&state, &mac_address)?;
+        let domain = normalize_domain_name(&domain).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let result = state
+                .observation
+                .delete_domain_data(Some(&mac_address), &domain)
+                .map_err(|error| {
+                        eprintln!("device domain deletion failed: {error}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        state.dns_cache
+                .purge_domain_data(Some(&mac_address), &domain);
+        Ok(Json(result))
+}
+
+/// Remove a canonical domain attribution from every device.
+async fn delete_global_domain_data(
+        State(state): State<AppState>,
+        Path(domain): Path<String>,
+        headers: HeaderMap,
+) -> Result<Json<DataDeletionResult>, StatusCode> {
+        require_csrf(&state, &headers)?;
+        let domain = normalize_domain_name(&domain).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let result = state
+                .observation
+                .delete_domain_data(None, &domain)
+                .map_err(|error| {
+                        eprintln!("global domain deletion failed: {error}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        state.dns_cache.purge_domain_data(None, &domain);
+        Ok(Json(result))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DeleteTimeRangeQuery {
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+}
+
+/// Delete Flow rows intersecting a range and minute rows whose key falls inside it.
+async fn delete_time_range_data(
+        State(state): State<AppState>,
+        Query(query): Query<DeleteTimeRangeQuery>,
+        headers: HeaderMap,
+) -> Result<Json<DataDeletionResult>, StatusCode> {
+        require_csrf(&state, &headers)?;
+        let range = DataTimeRange::new(query.from_ms, query.to_ms)
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let result = state
+                .observation
+                .delete_data_range(range)
+                .map_err(|error| {
+                        eprintln!("time range deletion failed: {error}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        state.dns_cache.purge_data_range(range);
+        Ok(Json(result))
+}
+
+fn require_csrf(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
+        let csrf_token = headers
+                .get("x-csrf-token")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+        auth::csrf_request_is_valid(state, headers, csrf_token)
+                .then_some(())
+                .ok_or(StatusCode::FORBIDDEN)
 }
 
 /// 确认设备存在；不存在返回 404，查询失败返回 500。

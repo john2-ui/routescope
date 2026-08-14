@@ -17,8 +17,8 @@ use std::{
 
 use crate::auth;
 use crate::domain::{
-        Device, DeviceMinuteStat, DomainMinuteStat, DomainTrafficSummary, Flow,
-        normalize_display_name,
+        DataDeletionResult, DataTimeRange, Device, DeviceMinuteStat, DomainMinuteStat,
+        DomainTrafficSummary, Flow, normalize_display_name, normalize_domain_name,
 };
 use crate::service::FlowQueryError;
 use crate::state::AppState;
@@ -51,6 +51,14 @@ struct DevicesTemplate {
         csrf_token: String,
         collector_status: String,
         devices: Vec<DeviceRow>,
+}
+
+#[derive(Template)]
+#[template(path = "privacy.html")]
+struct PrivacyTemplate {
+        csrf_token: String,
+        collector_status: String,
+        result_message: String,
 }
 
 #[derive(Template)]
@@ -122,6 +130,7 @@ struct DomainRow {
         total_bytes: String,
         source: String,
         confidence: String,
+        delete_action: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,6 +215,17 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
                 .route("/devices", get(devices))
                 .route("/devices/{mac_address}", get(device_detail))
                 .route("/devices/{mac_address}/name", post(update_device_name))
+                .route("/privacy", get(privacy_page))
+                .route(
+                        "/privacy/devices/{mac_address}/delete",
+                        post(delete_device_data),
+                )
+                .route(
+                        "/privacy/devices/{mac_address}/domains/delete",
+                        post(delete_device_domain_data),
+                )
+                .route("/privacy/domains/delete", post(delete_global_domain_data))
+                .route("/privacy/range/delete", post(delete_time_range_data))
                 .route_layer(middleware::from_fn_with_state(state, auth::require_admin))
 }
 
@@ -395,6 +415,37 @@ async fn devices(
                         csrf_token: csrf_token.clone(),
                         collector_status: state.collector_health.snapshot().state,
                         devices: build_device_rows(&state.observation)?,
+                },
+                &csrf_token,
+        )
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PrivacyQuery {
+        result: Option<String>,
+        changes: Option<usize>,
+}
+
+/// Render destructive privacy controls separately from the observation pages.
+async fn privacy_page(
+        State(state): State<AppState>,
+        Query(query): Query<PrivacyQuery>,
+        headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+        let result_message = match query.result.as_deref() {
+                Some("device") => format_deletion_message("device", query.changes),
+                Some("device-domain") => format_deletion_message("device domain", query.changes),
+                Some("global-domain") => format_deletion_message("global domain", query.changes),
+                Some("range") => format_deletion_message("time range", query.changes),
+                _ => String::new(),
+        };
+        let csrf_token = page_csrf_token(&headers);
+        render_page(
+                &state,
+                PrivacyTemplate {
+                        csrf_token: csrf_token.clone(),
+                        collector_status: state.collector_health.snapshot().state,
+                        result_message,
                 },
                 &csrf_token,
         )
@@ -597,6 +648,161 @@ async fn update_device_name(
         }
 }
 
+#[derive(Debug, Deserialize)]
+struct DeleteDomainForm {
+        csrf_token: String,
+        domain: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteRangeForm {
+        csrf_token: String,
+        from_ms: String,
+        to_ms: String,
+}
+
+async fn delete_device_data(
+        State(state): State<AppState>,
+        Path(mac_address): Path<String>,
+        headers: HeaderMap,
+        Form(form): Form<CsrfForm>,
+) -> Response {
+        let csrf_token = form.csrf_token.unwrap_or_default();
+        if !auth::csrf_request_is_valid(&state, &headers, &csrf_token) {
+                return (StatusCode::FORBIDDEN, "Invalid CSRF token.").into_response();
+        }
+        match state.observation.delete_device_data(&mac_address) {
+                Ok(Some(result)) => {
+                        state.dns_cache.purge_device_data(&mac_address);
+                        privacy_redirect("device", &result)
+                }
+                Ok(None) => StatusCode::NOT_FOUND.into_response(),
+                Err(error) => {
+                        eprintln!("web device deletion failed: {error}");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+        }
+}
+
+async fn delete_device_domain_data(
+        State(state): State<AppState>,
+        Path(mac_address): Path<String>,
+        headers: HeaderMap,
+        Form(form): Form<DeleteDomainForm>,
+) -> Response {
+        if !auth::csrf_request_is_valid(&state, &headers, &form.csrf_token) {
+                return (StatusCode::FORBIDDEN, "Invalid CSRF token.").into_response();
+        }
+        let domain = match normalize_domain_name(&form.domain) {
+                Ok(domain) => domain,
+                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+        match state.observation.device(&mac_address) {
+                Ok(Some(_)) => {}
+                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                Err(error) => {
+                        eprintln!("device lookup before domain deletion failed: {error}");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+        }
+        match state
+                .observation
+                .delete_domain_data(Some(&mac_address), &domain)
+        {
+                Ok(result) => {
+                        state.dns_cache
+                                .purge_domain_data(Some(&mac_address), &domain);
+                        privacy_redirect("device-domain", &result)
+                }
+                Err(error) => {
+                        eprintln!("web device domain deletion failed: {error}");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+        }
+}
+
+async fn delete_global_domain_data(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        Form(form): Form<DeleteDomainForm>,
+) -> Response {
+        if !auth::csrf_request_is_valid(&state, &headers, &form.csrf_token) {
+                return (StatusCode::FORBIDDEN, "Invalid CSRF token.").into_response();
+        }
+        let domain = match normalize_domain_name(&form.domain) {
+                Ok(domain) => domain,
+                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+        match state.observation.delete_domain_data(None, &domain) {
+                Ok(result) => {
+                        state.dns_cache.purge_domain_data(None, &domain);
+                        privacy_redirect("global-domain", &result)
+                }
+                Err(error) => {
+                        eprintln!("web global domain deletion failed: {error}");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+        }
+}
+
+async fn delete_time_range_data(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        Form(form): Form<DeleteRangeForm>,
+) -> Response {
+        if !auth::csrf_request_is_valid(&state, &headers, &form.csrf_token) {
+                return (StatusCode::FORBIDDEN, "Invalid CSRF token.").into_response();
+        }
+        let from_ms = match parse_optional_timestamp(&form.from_ms) {
+                Ok(value) => value,
+                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+        let to_ms = match parse_optional_timestamp(&form.to_ms) {
+                Ok(value) => value,
+                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+        let range = match DataTimeRange::new(from_ms, to_ms) {
+                Ok(range) => range,
+                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+        match state.observation.delete_data_range(range) {
+                Ok(result) => {
+                        state.dns_cache.purge_data_range(range);
+                        privacy_redirect("range", &result)
+                }
+                Err(error) => {
+                        eprintln!("web time range deletion failed: {error}");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+        }
+}
+
+fn parse_optional_timestamp(value: &str) -> Result<Option<i64>, &'static str> {
+        let value = value.trim();
+        if value.is_empty() {
+                return Ok(None);
+        }
+        value.parse::<i64>()
+                .map(Some)
+                .map_err(|_| "time boundary must be a Unix millisecond integer")
+}
+
+fn privacy_redirect(scope: &str, result: &DataDeletionResult) -> Response {
+        Redirect::to(&format!(
+                "/privacy?result={scope}&changes={}",
+                result.total_changes()
+        ))
+        .into_response()
+}
+
+fn format_deletion_message(scope: &str, changes: Option<usize>) -> String {
+        format!(
+                "{} deletion complete: {} changed rows",
+                scope,
+                changes.unwrap_or(0)
+        )
+}
+
 fn build_device_rows(
         state: &Arc<crate::service::ObservationService>,
 ) -> Result<Vec<DeviceRow>, StatusCode> {
@@ -734,6 +940,7 @@ fn domain_row(
                 total_bytes: format_bytes(domain.total_bytes),
                 source: domain.source.as_str().to_owned(),
                 confidence: domain.confidence.as_str().to_owned(),
+                delete_action: format!("/privacy/devices/{mac_address}/domains/delete"),
         }
 }
 

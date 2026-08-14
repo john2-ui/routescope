@@ -12,7 +12,7 @@
     <span class="header-context">devices</span>
     <span class="header-spacer"></span>
     <span class="status status-{{ collector_status }}">[collector: {{ collector_status }}]</span>
-    <nav aria-label="主导航"><a href="/">F1 Overview</a><a class="active" href="/devices">F2 Devices</a></nav>
+    <nav aria-label="主导航"><a href="/">F1 Overview</a><a class="active" href="/devices">F2 Devices</a><a href="/privacy">F3 Privacy</a></nav>
     <form method="post" action="/logout" class="logout-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button type="submit">F10 Quit</button>
@@ -51,6 +51,6 @@
       {% endif %}
     </section>
   </main>
-  <footer class="keybar"><a href="/">F1 Overview</a><a href="/devices">F2 Devices</a><span>F5 Refresh</span><span>Enter Select</span></footer>
+  <footer class="keybar"><a href="/">F1 Overview</a><a href="/devices">F2 Devices</a><a href="/privacy">F3 Privacy</a><span>F5 Refresh</span><span>Enter Select</span></footer>
 </body>
 </html>

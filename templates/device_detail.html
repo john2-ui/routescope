@@ -12,7 +12,7 @@
     <span class="header-context">device/{{ device.mac_address }}</span>
     <span class="header-spacer"></span>
     <span class="status status-{{ collector_status }}">[collector: {{ collector_status }}]</span>
-    <nav aria-label="主导航"><a href="/">F1 Overview</a><a class="active" href="/devices">F2 Devices</a></nav>
+    <nav aria-label="主导航"><a href="/">F1 Overview</a><a class="active" href="/devices">F2 Devices</a><a href="/privacy">F3 Privacy</a></nav>
     <form method="post" action="/logout" class="logout-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button type="submit">F10 Quit</button>
@@ -55,7 +55,7 @@
       {% else %}
       <div class="table-wrap">
         <table class="terminal-table domain-table">
-          <thead><tr><th>DOMAIN</th><th>TOTAL</th><th>UPLOAD</th><th>DOWNLOAD</th><th>SOURCE</th><th>CONFIDENCE</th></tr></thead>
+          <thead><tr><th>DOMAIN</th><th>TOTAL</th><th>UPLOAD</th><th>DOWNLOAD</th><th>SOURCE</th><th>CONFIDENCE</th><th>ACTION</th></tr></thead>
           <tbody>
           {% for domain in domains %}
             <tr>
@@ -65,6 +65,13 @@
               <td class="traffic-down">↓ {{ domain.download_bytes }}</td>
               <td>[{{ domain.source }}]</td>
               <td><span class="status status-{{ domain.confidence }}">[{{ domain.confidence }}]</span></td>
+              <td>
+                <form method="post" action="{{ domain.delete_action }}" class="compact-form">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="domain" value="{{ domain.domain }}">
+                  <button class="danger-button" type="submit">[forget]</button>
+                </form>
+              </td>
             </tr>
           {% endfor %}
           </tbody>
@@ -138,7 +145,18 @@
       </div>
       {% endif %}
     </section>
+
+    <section class="terminal-window danger-zone">
+      <div class="terminal-title"><span>[ privacy / destructive ]</span><a href="/privacy">all privacy controls →</a></div>
+      <div class="danger-row">
+        <p><strong>Forget this device.</strong> Deletes its identity, Flow rows and all minute aggregates. New observations may recreate it.</p>
+        <form method="post" action="/privacy/devices/{{ device.mac_address }}/delete" class="compact-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="danger-button" type="submit">[delete device]</button>
+        </form>
+      </div>
+    </section>
   </main>
-  <footer class="keybar"><a href="/">F1 Overview</a><a href="/devices">F2 Devices</a><span>F5 Refresh</span><span>Enter Select</span></footer>
+  <footer class="keybar"><a href="/">F1 Overview</a><a href="/devices">F2 Devices</a><a href="/privacy">F3 Privacy</a><span>F5 Refresh</span><span>Enter Select</span></footer>
 </body>
 </html>

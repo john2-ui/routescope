@@ -9,7 +9,9 @@ Linux 软路由流量观测与统计工具。
 拓扑中采集 LAN ingress/egress 上的 IPv4 TCP/UDP 双向 Flow，并可选通过只读
 conntrack netlink 快照补齐 NAT 关联；可选的本地 DNS UDP/TCP 转发与 IPv4 域名归因
 已经接入。DNS 观察通过 Flow 时间区间解析到稳定 MAC 身份；无法唯一确认时会暂存并
-重试，不会按可复用的客户端 IP 猜测。本地管理员账户认证、会话和 CSRF 防护也已经接入。
+重试，不会按可复用的客户端 IP 猜测。DNS 晚于 Flow 到达时会通过内部分钟贡献账本
+幂等回填已落库 Flow，并修正域名分钟聚合；短暂写入失败会保留 binding 等待下次重试。
+本地管理员账户认证、会话和 CSRF 防护也已经接入。
 管理页面采用紧凑的
 htop/Linux 终端风格，并支持查询单设备、单域名最近 30 天的分钟流量趋势。
 
@@ -17,7 +19,7 @@ htop/Linux 终端风格，并支持查询单设备、单域名最近 30 天的�
 - `GET /readyz` 用于判断存储和已启用采集器是否已完成启动；
 - `/login` 是公开的登录页面，管理页和 `/api/v1/*` 需要有效会话；
 - 设置 `ROUTESCOPE_DEV_BYPASS_AUTH=1` 后，仅当监听地址是 loopback 时可在本地联调
-  `/api/v1/*` 只读接口；
+  `/api/v1/*`；写操作仍要求匹配的 CSRF Cookie 与请求参数/Header；
 - 首次部署时设置 `ROUTESCOPE_ADMIN_USERNAME` 和 Argon2id PHC 格式的
   `ROUTESCOPE_ADMIN_PASSWORD_HASH`；首个启动会将账户哈希写入 SQLite，后续启动从本地库读取；
 - 可用 `printf '%s\n' 'your-password' | cargo run --quiet -- hash-password` 生成密码哈希；
@@ -41,6 +43,11 @@ htop/Linux 终端风格，并支持查询单设备、单域名最近 30 天的�
 - `GET /api/v1/devices/<mac>/flows?window=24h&limit=50` 按 `1h`/`6h`/`24h`
   时间窗返回 Flow 分页对象，包含 `items`、`next_cursor`、`previous_cursor`、
   `window`、`since_ms` 和 `limit`；继续翻页时仅传 `cursor`。默认 50 条，最多 500 条。
+- 管理员可通过 F3 Privacy 页面或带 `X-CSRF-Token` 的删除 API 主动清理敏感元数据：
+  `DELETE /api/v1/devices/<mac>` 删除整个设备，设备内及全局域名删除接口只清除域名归因，
+  `DELETE /api/v1/data?from_ms=...&to_ms=...` 使用半开时间区间删除观测数据。
+- 主动删除不可恢复且不记录持久化审计日志，但不会建立永久排除规则；运行中的采集器
+  可能在后续周期重新创建新的设备、Flow 或域名记录。
 - SQLite 使用 `PRAGMA user_version` 执行 schema 迁移，Flow 批次在单事务中写入；可用
   `make benchmark` 或 `cargo run --release -- benchmark-storage 10000` 做离线写入基准。
 - 收到 SIGINT/SIGTERM 后会停止采集、DNS、清理后台任务并等待 HTTP 连接，超时由
@@ -103,8 +110,8 @@ eBPF 双向 Flow 能按客户端 MAC 出现在 API 中，并在启用 conntrack 
 `make namespace-dns-test` 运行 `tests/namespace_dns.rs` 的特权集成测试，额外验证
 DNS UDP/TCP 转发、域名归因、LAN `rx/tx` 计数核对以及两个客户端的可配置大流量并发。
 默认大流量大小为 1 MiB，可通过
-`ROUTESCOPE_NAMESPACE_LARGE_PAYLOAD_BYTES` 调整。详细结果与后续缺口见
-[首版网络验收基线](docs/acceptance-baseline.md)。
+`ROUTESCOPE_NAMESPACE_LARGE_PAYLOAD_BYTES` 调整。验收范围与当前实现状态见
+[架构设计](docs/architecture.md)。
 
 ## 项目结构
 
@@ -118,13 +125,13 @@ src/dns_proxy.rs 本地 DNS UDP/TCP 转发与 A 记录解析
 src/routescope_tc.c TC eBPF IPv4 TCP/UDP 统计程序
 build.rs          编译 TC eBPF 对象文件
 src/domain.rs  Device、Flow 和域名归因领域模型
-src/service.rs 观测查询、Flow 写入和保留期清理
-src/storage.rs SQLite 仓储、Flow keyset 分页、分钟聚合与清理
-src/web.rs     服务端渲染页面与静态资源路由
+src/service.rs 观测查询、Flow 写入、域名回填和主动删除
+src/storage.rs SQLite 仓储、Flow 分页、贡献账本、分钟聚合与主动删除
+src/web.rs     服务端渲染页面、设备命名、隐私管理与静态资源路由
 scripts/namespace_lab.sh namespace 拓扑创建、清理和 smoke test
 scripts/dns_test_server.py 确定性 UDP/TCP DNS 上游测试服务
 tests/namespace_dns.rs namespace DNS 与流量归因集成测试
-docs/acceptance-baseline.md 首版网络验收结果与后续优先级
+docs/architecture.md 产品边界、网络架构、验收标准与实现进度
 templates/     Askama HTML 模板
 static/        CSS 等静态资源
 config/        示例配置

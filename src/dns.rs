@@ -1,4 +1,7 @@
-use crate::domain::{DomainAttribution, DomainConfidence, DomainSource, Flow};
+use crate::domain::{
+        DataTimeRange, DomainAttribution, DomainConfidence, DomainSource, Flow,
+        ResolvedDomainBinding, normalize_domain_name,
+};
 use std::{
         collections::{HashMap, HashSet, VecDeque},
         net::Ipv4Addr,
@@ -9,6 +12,7 @@ const IDENTITY_MATCH_GRACE_MS: i64 = 5_000;
 const IDENTITY_IDLE_RETENTION_MS: i64 = 5 * 60 * 1_000;
 const MAX_PENDING_AGE_MS: i64 = 5 * 60 * 1_000;
 const MAX_PENDING_OBSERVATIONS: usize = 4_096;
+const MAX_RESOLVED_BINDINGS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsObservation {
@@ -88,6 +92,7 @@ struct DnsCacheState {
         bindings: HashMap<(String, Ipv4Addr), Vec<DomainBinding>>,
         identities: HashMap<String, ClientIdentityInterval>,
         pending: VecDeque<PendingDnsObservation>,
+        resolved: VecDeque<ResolvedDomainBinding>,
 }
 
 #[derive(Debug, Default)]
@@ -243,6 +248,182 @@ impl DnsAttributionCache {
                         .expect("DNS attribution cache mutex poisoned");
                 purge_state(&mut state, now_ms)
         }
+
+        /// Drain newly resolved stable bindings for persistent Flow backfill.
+        pub fn drain_resolved_bindings(&self) -> Vec<ResolvedDomainBinding> {
+                let mut state = self
+                        .state
+                        .lock()
+                        .expect("DNS attribution cache mutex poisoned");
+                state.resolved.drain(..).collect()
+        }
+
+        /// Restore bindings after a transient persistence failure so the next loop retries them.
+        pub fn requeue_resolved_bindings(&self, bindings: Vec<ResolvedDomainBinding>) {
+                let mut state = self
+                        .state
+                        .lock()
+                        .expect("DNS attribution cache mutex poisoned");
+                for binding in bindings {
+                        let Ok(target_ip) = binding.target_ip.parse::<Ipv4Addr>() else {
+                                continue;
+                        };
+                        let still_unique = state
+                                .bindings
+                                .get(&(binding.client_mac.clone(), target_ip))
+                                .is_some_and(|entries| {
+                                        entries.len() == 1
+                                                && entries[0].domain == binding.attribution.domain
+                                                && entries[0].associated_at
+                                                        == binding.attribution.associated_at
+                                                && Some(entries[0].expires_at)
+                                                        == binding.attribution.expires_at
+                                });
+                        if !still_unique {
+                                continue;
+                        }
+                        state.resolved.retain(|queued| {
+                                queued.client_mac != binding.client_mac
+                                        || queued.target_ip != binding.target_ip
+                        });
+                        while state.resolved.len() >= MAX_RESOLVED_BINDINGS {
+                                state.resolved.pop_front();
+                        }
+                        state.resolved.push_back(binding);
+                }
+        }
+
+        /// Forget all in-memory DNS and identity state associated with one device.
+        pub fn purge_device_data(&self, mac_address: &str) -> usize {
+                let Some(mac_address) = normalize_mac(mac_address) else {
+                        return 0;
+                };
+                let mut state = self
+                        .state
+                        .lock()
+                        .expect("DNS attribution cache mutex poisoned");
+                let before = state_item_count(&state);
+                let identities = state.identities.values().cloned().collect::<Vec<_>>();
+                state.bindings
+                        .retain(|(client_mac, _), _| client_mac != &mac_address);
+                state.identities
+                        .retain(|_, identity| identity.client_mac != mac_address);
+                state.pending.retain(|observation| {
+                        !pending_uniquely_matches_mac(&identities, observation, &mac_address)
+                });
+                state.resolved
+                        .retain(|binding| binding.client_mac != mac_address);
+                before.saturating_sub(state_item_count(&state))
+        }
+
+        /// Forget one domain globally or only for a selected device.
+        pub fn purge_domain_data(&self, mac_address: Option<&str>, domain: &str) -> usize {
+                let Ok(domain) = normalize_domain_name(domain) else {
+                        return 0;
+                };
+                let mac_address = match mac_address {
+                        Some(mac_address) => {
+                                let Some(mac_address) = normalize_mac(mac_address) else {
+                                        return 0;
+                                };
+                                Some(mac_address)
+                        }
+                        None => None,
+                };
+                let mut state = self
+                        .state
+                        .lock()
+                        .expect("DNS attribution cache mutex poisoned");
+                let before = state_item_count(&state);
+                let identities = state.identities.values().cloned().collect::<Vec<_>>();
+                state.bindings.retain(|(client_mac, _), entries| {
+                        if mac_address
+                                .as_deref()
+                                .is_none_or(|selected| selected == client_mac)
+                        {
+                                entries.retain(|entry| entry.domain != domain);
+                        }
+                        !entries.is_empty()
+                });
+                state.pending.retain(|observation| {
+                        observation.domain != domain
+                                || mac_address.is_some()
+                                        && !pending_uniquely_matches_mac(
+                                                &identities,
+                                                observation,
+                                                mac_address.as_deref().expect("checked as some"),
+                                        )
+                });
+                state.resolved.retain(|binding| {
+                        binding.attribution.domain != domain
+                                || mac_address
+                                        .as_deref()
+                                        .is_some_and(|selected| selected != binding.client_mac)
+                });
+                before.saturating_sub(state_item_count(&state))
+        }
+
+        /// Forget DNS state whose observation/association interval falls in a deleted range.
+        pub fn purge_data_range(&self, range: DataTimeRange) -> usize {
+                let mut state = self
+                        .state
+                        .lock()
+                        .expect("DNS attribution cache mutex poisoned");
+                let before = state_item_count(&state);
+                state.bindings.retain(|_, entries| {
+                        entries.retain(|entry| !timestamp_in_range(entry.associated_at, range));
+                        !entries.is_empty()
+                });
+                state.identities.retain(|_, identity| {
+                        !intervals_overlap(
+                                identity.first_seen,
+                                identity.last_seen.saturating_add(1),
+                                range,
+                        )
+                });
+                state.pending.retain(|observation| {
+                        !timestamp_in_range(observation.observed_at_ms, range)
+                });
+                state.resolved.retain(|binding| {
+                        !timestamp_in_range(binding.attribution.associated_at, range)
+                });
+                before.saturating_sub(state_item_count(&state))
+        }
+}
+
+fn timestamp_in_range(timestamp_ms: i64, range: DataTimeRange) -> bool {
+        timestamp_ms >= range.from_ms && timestamp_ms < range.to_ms
+}
+
+fn intervals_overlap(from_ms: i64, to_ms: i64, range: DataTimeRange) -> bool {
+        from_ms < range.to_ms && to_ms > range.from_ms
+}
+
+fn pending_uniquely_matches_mac(
+        identities: &[ClientIdentityInterval],
+        observation: &PendingDnsObservation,
+        mac_address: &str,
+) -> bool {
+        let candidates = identities
+                .iter()
+                .filter(|identity| {
+                        identity.client_ip == observation.client_ip
+                                && identity.first_seen <= observation.observed_at_ms
+                                && observation.observed_at_ms
+                                        <= identity
+                                                .last_seen
+                                                .saturating_add(IDENTITY_MATCH_GRACE_MS)
+                })
+                .map(|identity| identity.client_mac.as_str())
+                .collect::<HashSet<_>>();
+        candidates.len() == 1 && candidates.contains(mac_address)
+}
+
+fn state_item_count(state: &DnsCacheState) -> usize {
+        state.bindings.values().map(Vec::len).sum::<usize>()
+                + state.identities.len()
+                + state.pending.len()
+                + state.resolved.len()
 }
 
 fn prepare_observation(observation: DnsObservation) -> Option<PendingDnsObservation> {
@@ -308,8 +489,7 @@ fn resolve_pending(state: &mut DnsCacheState, now_ms: i64) -> usize {
 
                 if candidates.len() == 1 {
                         let client_mac = candidates.into_iter().next().expect("one candidate");
-                        updated +=
-                                add_domain_bindings(&mut state.bindings, &client_mac, &observation);
+                        updated += add_domain_bindings(state, &client_mac, &observation);
                 } else {
                         unresolved.push_back(observation);
                 }
@@ -320,31 +500,63 @@ fn resolve_pending(state: &mut DnsCacheState, now_ms: i64) -> usize {
 }
 
 fn add_domain_bindings(
-        bindings: &mut HashMap<(String, Ipv4Addr), Vec<DomainBinding>>,
+        state: &mut DnsCacheState,
         client_mac: &str,
         observation: &PendingDnsObservation,
 ) -> usize {
         let mut updated = 0;
         for target_ip in &observation.target_ips {
-                let entries = bindings
-                        .entry((client_mac.to_owned(), *target_ip))
-                        .or_default();
-                entries.retain(|entry| entry.expires_at > observation.observed_at_ms);
+                let resolved = {
+                        let entries = state
+                                .bindings
+                                .entry((client_mac.to_owned(), *target_ip))
+                                .or_default();
+                        entries.retain(|entry| entry.expires_at > observation.observed_at_ms);
 
-                if let Some(entry) = entries
-                        .iter_mut()
-                        .find(|entry| entry.domain == observation.domain)
-                {
-                        if observation.observed_at_ms >= entry.associated_at {
-                                entry.associated_at = observation.observed_at_ms;
-                                entry.expires_at = observation.binding_expires_at;
+                        let binding_updated = if let Some(entry) = entries
+                                .iter_mut()
+                                .find(|entry| entry.domain == observation.domain)
+                        {
+                                if observation.observed_at_ms >= entry.associated_at {
+                                        entry.associated_at = observation.observed_at_ms;
+                                        entry.expires_at = observation.binding_expires_at;
+                                        true
+                                } else {
+                                        false
+                                }
+                        } else {
+                                entries.push(DomainBinding {
+                                        domain: observation.domain.clone(),
+                                        associated_at: observation.observed_at_ms,
+                                        expires_at: observation.binding_expires_at,
+                                });
+                                true
+                        };
+                        binding_updated.then(|| (entries.len() == 1).then(|| entries[0].clone()))
+                };
+                if let Some(resolved) = resolved {
+                        let target_ip_string = target_ip.to_string();
+                        state.resolved.retain(|binding| {
+                                binding.client_mac != client_mac
+                                        || binding.target_ip != target_ip_string
+                        });
+                        let Some(entry) = resolved else {
                                 updated += 1;
+                                continue;
+                        };
+                        while state.resolved.len() >= MAX_RESOLVED_BINDINGS {
+                                state.resolved.pop_front();
                         }
-                } else {
-                        entries.push(DomainBinding {
-                                domain: observation.domain.clone(),
-                                associated_at: observation.observed_at_ms,
-                                expires_at: observation.binding_expires_at,
+                        state.resolved.push_back(ResolvedDomainBinding {
+                                client_mac: client_mac.to_owned(),
+                                target_ip: target_ip_string,
+                                attribution: DomainAttribution {
+                                        domain: entry.domain,
+                                        source: DomainSource::Dns,
+                                        confidence: DomainConfidence::High,
+                                        associated_at: entry.associated_at,
+                                        expires_at: Some(entry.expires_at),
+                                },
                         });
                         updated += 1;
                 }
@@ -367,14 +579,20 @@ fn purge_state(state: &mut DnsCacheState, now_ms: i64) -> usize {
         state.pending.retain(|observation| {
                 observation.pending_expires_at > now_ms && observation.binding_expires_at > now_ms
         });
+        state.resolved.retain(|binding| {
+                binding.attribution
+                        .expires_at
+                        .is_none_or(|expires_at| expires_at > now_ms)
+        });
 
         let remaining = state.bindings.values().map(Vec::len).sum::<usize>()
                 + state.identities.len()
-                + state.pending.len();
+                + state.pending.len()
+                + state.resolved.len();
         binding_count
                 .saturating_add(identity_count)
                 .saturating_add(pending_count)
-                .saturating_sub(remaining)
+                .saturating_sub(remaining.saturating_sub(state.resolved.len()))
 }
 
 fn normalize_mac(value: &str) -> Option<String> {
@@ -383,18 +601,7 @@ fn normalize_mac(value: &str) -> Option<String> {
 }
 
 fn normalize_domain(value: &str) -> Option<String> {
-        let domain = value.trim().trim_end_matches('.').to_ascii_lowercase();
-
-        if domain.is_empty()
-                || domain.len() > 253
-                || domain
-                        .split('.')
-                        .any(|label| label.is_empty() || label.len() > 63)
-        {
-                return None;
-        }
-
-        Some(domain)
+        normalize_domain_name(value).ok()
 }
 
 #[cfg(test)]
@@ -536,6 +743,167 @@ mod tests {
         }
 
         #[test]
+        fn resolved_binding_queue_drains_and_can_be_retried() {
+                let cache = DnsAttributionCache::new();
+                learn_identity(
+                        &cache,
+                        "dns-flow",
+                        "192.168.1.10",
+                        "AA:BB:CC:DD:EE:FF",
+                        500,
+                        1_500,
+                );
+                assert_eq!(cache.observe(observation("Example.COM.", 1_000, 60)), 1);
+
+                let bindings = cache.drain_resolved_bindings();
+                assert_eq!(bindings.len(), 1);
+                assert_eq!(bindings[0].client_mac, "aa:bb:cc:dd:ee:ff");
+                assert_eq!(bindings[0].target_ip, "93.184.216.34");
+                assert_eq!(bindings[0].attribution.domain, "example.com");
+                assert!(cache.drain_resolved_bindings().is_empty());
+
+                cache.requeue_resolved_bindings(bindings.clone());
+                assert_eq!(cache.drain_resolved_bindings(), bindings);
+        }
+
+        #[test]
+        fn privacy_purge_removes_only_selected_device_and_domain_state() {
+                let cache = DnsAttributionCache::new();
+                learn_identity(
+                        &cache,
+                        "device-a-flow",
+                        "192.168.1.10",
+                        "aa:bb:cc:dd:ee:01",
+                        500,
+                        1_500,
+                );
+                learn_identity(
+                        &cache,
+                        "device-b-flow",
+                        "192.168.1.11",
+                        "aa:bb:cc:dd:ee:02",
+                        500,
+                        1_500,
+                );
+                cache.observe(observation("shared.example", 1_000, 60));
+                let mut device_b_observation = observation("shared.example", 1_000, 60);
+                device_b_observation.client_ip = "192.168.1.11".parse().unwrap();
+                cache.observe(device_b_observation);
+                cache.observe(observation("keep.example", 1_100, 60));
+
+                assert_eq!(cache.purge_domain_data(Some(""), "shared.example"), 0);
+
+                assert!(cache.purge_domain_data(Some("aa:bb:cc:dd:ee:01"), "SHARED.EXAMPLE.") > 0);
+                {
+                        let state = cache.state.lock().unwrap();
+                        assert!(state.bindings.iter().any(|((mac, _), entries)| {
+                                mac == "aa:bb:cc:dd:ee:02"
+                                        && entries
+                                                .iter()
+                                                .any(|entry| entry.domain == "shared.example")
+                        }));
+                        assert!(state.bindings.iter().any(|((mac, _), entries)| {
+                                mac == "aa:bb:cc:dd:ee:01"
+                                        && entries
+                                                .iter()
+                                                .any(|entry| entry.domain == "keep.example")
+                        }));
+                        assert!(!state.bindings.iter().any(|((mac, _), entries)| {
+                                mac == "aa:bb:cc:dd:ee:01"
+                                        && entries
+                                                .iter()
+                                                .any(|entry| entry.domain == "shared.example")
+                        }));
+                }
+
+                learn_identity(
+                        &cache,
+                        "device-b-reused-ip",
+                        "192.168.1.10",
+                        "aa:bb:cc:dd:ee:02",
+                        500,
+                        1_500,
+                );
+                assert_eq!(cache.observe(observation("pending.example", 1_200, 60)), 0);
+                assert!(cache.purge_device_data("AA:BB:CC:DD:EE:01") > 0);
+                let state = cache.state.lock().unwrap();
+                assert!(state
+                        .identities
+                        .values()
+                        .all(|identity| identity.client_mac != "aa:bb:cc:dd:ee:01"));
+                assert!(state
+                        .bindings
+                        .keys()
+                        .all(|(mac, _)| mac != "aa:bb:cc:dd:ee:01"));
+                assert!(state
+                        .resolved
+                        .iter()
+                        .all(|binding| binding.client_mac != "aa:bb:cc:dd:ee:01"));
+                assert!(state
+                        .identities
+                        .values()
+                        .any(|identity| identity.client_mac == "aa:bb:cc:dd:ee:02"));
+                assert!(state
+                        .pending
+                        .iter()
+                        .any(|observation| observation.domain == "pending.example"));
+        }
+
+        #[test]
+        fn global_domain_and_time_range_purges_cover_pending_and_resolved_state() {
+                let cache = DnsAttributionCache::new();
+                learn_identity(
+                        &cache,
+                        "dns-flow",
+                        "192.168.1.10",
+                        "aa:bb:cc:dd:ee:ff",
+                        500,
+                        1_500,
+                );
+                cache.observe(observation("delete.example", 1_000, 60));
+                cache.observe(observation("keep.example", 2_000, 60));
+                {
+                        let mut state = cache.state.lock().unwrap();
+                        enqueue_pending(
+                                &mut state,
+                                prepare_observation(DnsObservation {
+                                        client_ip: "192.168.1.99".parse().unwrap(),
+                                        domain: "delete.example".to_owned(),
+                                        target_ips: vec!["203.0.113.1".parse().unwrap()],
+                                        observed_at_ms: 1_200,
+                                        ttl_secs: 60,
+                                })
+                                .unwrap(),
+                        );
+                }
+
+                assert!(cache.purge_domain_data(None, "delete.example") > 0);
+                {
+                        let state = cache.state.lock().unwrap();
+                        assert!(state
+                                .pending
+                                .iter()
+                                .all(|observation| observation.domain != "delete.example"));
+                        assert!(state
+                                .resolved
+                                .iter()
+                                .all(|binding| { binding.attribution.domain != "delete.example" }));
+                        assert!(state.bindings.values().all(|entries| {
+                                entries.iter().all(|entry| entry.domain != "delete.example")
+                        }));
+                }
+
+                assert!(cache.purge_data_range(DataTimeRange {
+                        from_ms: 1_500,
+                        to_ms: 2_500,
+                }) > 0);
+                let state = cache.state.lock().unwrap();
+                assert!(state.resolved.is_empty());
+                assert!(state.bindings.is_empty());
+                assert!(state.identities.is_empty());
+        }
+
+        #[test]
         fn attribute_flows_returns_number_of_successful_matches() {
                 let cache = DnsAttributionCache::new();
                 learn_identity(
@@ -596,7 +964,9 @@ mod tests {
                         1_500,
                 );
                 cache.observe(observation("first.example", 1_000, 60));
+                let stale_retry = cache.drain_resolved_bindings();
                 cache.observe(observation("second.example", 1_000, 60));
+                cache.requeue_resolved_bindings(stale_retry);
 
                 let mut flow = sample_flow(
                         "flow-ambiguous",
@@ -608,6 +978,7 @@ mod tests {
 
                 assert!(!cache.attribute_flow(&mut flow));
                 assert!(flow.domain.is_none());
+                assert!(cache.drain_resolved_bindings().is_empty());
         }
 
         #[test]

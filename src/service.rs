@@ -1,8 +1,9 @@
 //! Application use cases over the persistence layer.
 
 use crate::domain::{
-        Device, DeviceFlowSummary, DeviceMinuteStat, DomainMinuteStat, DomainTrafficSummary, Flow,
-        FlowPageAnchor, FlowPageDirection,
+        DataDeletionResult, DataTimeRange, Device, DeviceFlowSummary, DeviceMinuteStat,
+        DomainMinuteStat, DomainTrafficSummary, Flow, FlowPageAnchor, FlowPageDirection,
+        ResolvedDomainBinding,
 };
 use crate::storage::{RouteScopeRepository, SqliteRepository};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -349,6 +350,39 @@ impl ObservationService {
         /// 批量写入 flow，返回成功写入条数。
         pub fn ingest_flows(&self, flows: &[Flow]) -> Result<usize, rusqlite::Error> {
                 self.repo.upsert_flows(flows)
+        }
+
+        /// 将新解析出的稳定 DNS binding 回填到此前已写入的 Flow 和域名聚合。
+        pub fn backfill_domain_bindings(
+                &self,
+                bindings: &[ResolvedDomainBinding],
+        ) -> Result<usize, rusqlite::Error> {
+                self.repo.backfill_domain_bindings(bindings)
+        }
+
+        /// Hard-delete one device and all persisted observations associated with it.
+        pub fn delete_device_data(
+                &self,
+                mac_address: &str,
+        ) -> Result<Option<DataDeletionResult>, rusqlite::Error> {
+                self.repo.delete_device_data(mac_address)
+        }
+
+        /// Remove a canonical domain attribution from one device or every device.
+        pub fn delete_domain_data(
+                &self,
+                mac_address: Option<&str>,
+                domain: &str,
+        ) -> Result<DataDeletionResult, rusqlite::Error> {
+                self.repo.delete_domain_data(mac_address, domain)
+        }
+
+        /// Delete observations falling in a validated half-open time range.
+        pub fn delete_data_range(
+                &self,
+                range: DataTimeRange,
+        ) -> Result<DataDeletionResult, rusqlite::Error> {
+                self.repo.delete_data_range(range.from_ms, range.to_ms)
         }
 
         /// 按当前时间与保留策略清理过期 flow 与聚合数据。

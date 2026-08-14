@@ -151,6 +151,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Drain/purge must not depend on a flow collector: the DNS proxy can run alone.
         if config.dns_proxy_enabled {
                 background_tasks.push(tokio::spawn(run_dns_attribution_loop(
+                        Arc::clone(&observation),
                         Arc::clone(&dns_cache),
                         Arc::clone(&dns_source),
                         config.collector_interval_secs,
@@ -179,6 +180,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 observation,
                 auth,
                 collector_health,
+                dns_cache,
                 dev_bypass_auth: config.dev_bypass_auth,
                 secure_cookies: config.secure_cookies,
         };
@@ -264,8 +266,22 @@ fn refresh_dns_attribution(
         dns_cache.purge_expired(now_ms);
 }
 
+/// Persist newly resolved bindings. Failed batches are restored to the bounded
+/// cache queue and retried by the next DNS/collector tick.
+fn flush_dns_backfills(observation: &ObservationService, dns_cache: &DnsAttributionCache) {
+        let bindings = dns_cache.drain_resolved_bindings();
+        if bindings.is_empty() {
+                return;
+        }
+        if let Err(error) = observation.backfill_domain_bindings(&bindings) {
+                eprintln!("failed to backfill delayed DNS attribution: {error}");
+                dns_cache.requeue_resolved_bindings(bindings);
+        }
+}
+
 /// Keep the DNS observation queue drained even when no flow collector is running.
 async fn run_dns_attribution_loop(
+        observation: Arc<ObservationService>,
         dns_cache: Arc<DnsAttributionCache>,
         dns_source: Arc<dyn DnsObservationSource>,
         interval_secs: u64,
@@ -285,6 +301,7 @@ async fn run_dns_attribution_loop(
                     }
                 }
                 refresh_dns_attribution(dns_cache.as_ref(), dns_source.as_ref(), now_ms());
+                flush_dns_backfills(observation.as_ref(), dns_cache.as_ref());
         }
 }
 
@@ -322,6 +339,7 @@ async fn run_collection_loop(
                                         dns_source.as_ref(),
                                         batch.observed_at_ms,
                                 );
+                                flush_dns_backfills(observation.as_ref(), dns_cache.as_ref());
                                 dns_cache.attribute_flows(&mut batch.flows);
 
                                 if batch.health.state != collector::CollectorHealthState::Healthy {
@@ -489,6 +507,7 @@ mod tests {
                         observation,
                         auth,
                         collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dns_cache: Arc::new(DnsAttributionCache::new()),
                         dev_bypass_auth,
                         secure_cookies: false,
                 })
@@ -504,6 +523,7 @@ mod tests {
                         observation,
                         auth,
                         collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dns_cache: Arc::new(DnsAttributionCache::new()),
                         dev_bypass_auth: false,
                         secure_cookies: false,
                 })
@@ -521,6 +541,58 @@ mod tests {
 
         fn cookie_value(cookie: &str) -> &str {
                 cookie.split_once('=').unwrap().1
+        }
+
+        #[test]
+        fn delayed_dns_queue_flush_backfills_persisted_flow() {
+                let repo = Arc::new(SqliteRepository::open_in_memory().unwrap());
+                let observation_service = ObservationService::new(Arc::clone(&repo), 24, 30);
+                let flow = Flow {
+                        flow_id: "late-dns-main".to_owned(),
+                        first_seen: 60_000,
+                        last_seen: 65_000,
+                        protocol: "tcp".to_owned(),
+                        direction: FlowDirection::Bidirectional,
+                        lan_interface: "br-lan".to_owned(),
+                        wan_interface: "eth0".to_owned(),
+                        client_mac: "aa:bb:cc:dd:ee:ff".to_owned(),
+                        client_ip: "192.168.1.10".to_owned(),
+                        client_port: 40_000,
+                        destination_ip: "93.184.216.34".to_owned(),
+                        destination_port: 443,
+                        nat_source_ip: None,
+                        nat_source_port: None,
+                        nat_destination_ip: None,
+                        nat_destination_port: None,
+                        upload_bytes: 100,
+                        download_bytes: 200,
+                        packet_count: 3,
+                        domain: None,
+                        connection_state: ConnectionState::Established,
+                };
+                observation_service
+                        .ingest_flows(std::slice::from_ref(&flow))
+                        .unwrap();
+
+                let cache = DnsAttributionCache::new();
+                cache.learn_flow_identities(std::slice::from_ref(&flow), flow.last_seen);
+                let queue = DnsObservationQueue::new();
+                queue.push(dns::DnsObservation {
+                        client_ip: "192.168.1.10".parse().unwrap(),
+                        domain: "late.example".to_owned(),
+                        target_ips: vec!["93.184.216.34".parse().unwrap()],
+                        observed_at_ms: 64_000,
+                        ttl_secs: 60,
+                });
+                refresh_dns_attribution(&cache, &queue, 65_000);
+                flush_dns_backfills(&observation_service, &cache);
+
+                let stats = repo
+                        .list_domain_minute_stats(&flow.client_mac, "late.example", 0)
+                        .unwrap();
+                assert_eq!(stats.len(), 1);
+                assert_eq!(stats[0].upload_bytes, 100);
+                assert_eq!(stats[0].download_bytes, 200);
         }
 
         #[tokio::test]
@@ -590,6 +662,7 @@ mod tests {
                         observation,
                         auth,
                         collector_health,
+                        dns_cache: Arc::new(DnsAttributionCache::new()),
                         dev_bypass_auth: false,
                         secure_cookies: false,
                 })
@@ -611,7 +684,9 @@ mod tests {
 
         #[tokio::test]
         async fn protected_api_requires_authentication() {
-                let response = test_app(false)
+                let application = test_app(false);
+                let response = application
+                        .clone()
                         .oneshot(
                                 Request::builder()
                                         .uri("/api/v1/devices")
@@ -621,6 +696,18 @@ mod tests {
                         .await
                         .unwrap();
                 assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+                let deletion = application
+                        .oneshot(
+                                Request::builder()
+                                        .method("DELETE")
+                                        .uri("/api/v1/domains/example.com")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(deletion.status(), StatusCode::UNAUTHORIZED);
         }
 
         #[tokio::test]
@@ -756,6 +843,7 @@ mod tests {
                         observation,
                         auth,
                         collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dns_cache: Arc::new(DnsAttributionCache::new()),
                         dev_bypass_auth: true,
                         secure_cookies: false,
                 })
@@ -800,6 +888,7 @@ mod tests {
                         observation,
                         auth,
                         collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dns_cache: Arc::new(DnsAttributionCache::new()),
                         dev_bypass_auth: true,
                         secure_cookies: false,
                 });
@@ -941,6 +1030,7 @@ mod tests {
                         observation,
                         auth,
                         collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dns_cache: Arc::new(DnsAttributionCache::new()),
                         dev_bypass_auth: true,
                         secure_cookies: false,
                 });
@@ -1006,6 +1096,7 @@ mod tests {
                         observation,
                         auth,
                         collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dns_cache: Arc::new(DnsAttributionCache::new()),
                         dev_bypass_auth: true,
                         secure_cookies: false,
                 });
@@ -1111,6 +1202,7 @@ mod tests {
                         observation,
                         auth,
                         collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dns_cache: Arc::new(DnsAttributionCache::new()),
                         dev_bypass_auth: true,
                         secure_cookies: false,
                 });
@@ -1169,5 +1261,285 @@ mod tests {
                         .await
                         .unwrap();
                 assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn destructive_api_requires_csrf_and_deletes_domain_range_and_device_data() {
+                let repo = Arc::new(SqliteRepository::open_in_memory().unwrap());
+                let observation = Arc::new(ObservationService::new(Arc::clone(&repo), 24, 30));
+                let mut flow = SimulatedCollector::new().collect().unwrap().flows[0].clone();
+                flow.flow_id = "privacy-api-flow".to_owned();
+                let mac = flow.client_mac.clone();
+                let domain = flow.domain.as_ref().unwrap().domain.clone();
+                let flow_time = flow.last_seen;
+                observation
+                        .ingest_flows(std::slice::from_ref(&flow))
+                        .unwrap();
+                let auth = Arc::new(
+                        AuthService::from_repository(Arc::clone(&repo), "admin".to_owned(), None)
+                                .unwrap(),
+                );
+                let application = app(AppState {
+                        observation: Arc::clone(&observation),
+                        auth,
+                        collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dns_cache: Arc::new(DnsAttributionCache::new()),
+                        dev_bypass_auth: true,
+                        secure_cookies: false,
+                });
+                let domain_uri = format!("/api/v1/devices/{mac}/domains/{domain}");
+
+                let forbidden = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .method("DELETE")
+                                        .uri(&domain_uri)
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+                let csrf_cookie = format!("{}=privacy-token", auth::CSRF_COOKIE_NAME);
+                let deleted_domain = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .method("DELETE")
+                                        .uri(&domain_uri)
+                                        .header(header::COOKIE, &csrf_cookie)
+                                        .header("x-csrf-token", "privacy-token")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(deleted_domain.status(), StatusCode::OK);
+                let body = to_bytes(deleted_domain.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                let result: crate::domain::DataDeletionResult =
+                        serde_json::from_slice(&body).unwrap();
+                assert_eq!(result.flows_redacted, 1);
+                assert!(repo
+                        .list_domain_minute_stats(&mac, &domain, 0)
+                        .unwrap()
+                        .is_empty());
+
+                let mut global_flow = flow.clone();
+                global_flow.flow_id = "privacy-api-global-domain".to_owned();
+                global_flow.client_mac = "00:00:00:00:00:02".to_owned();
+                global_flow.client_ip = "192.168.1.22".to_owned();
+                observation.ingest_flows(&[global_flow]).unwrap();
+                let global_domain = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .method("DELETE")
+                                        .uri(format!(
+                                                "/api/v1/domains/{}",
+                                                domain.to_ascii_uppercase()
+                                        ))
+                                        .header(header::COOKIE, &csrf_cookie)
+                                        .header("x-csrf-token", "privacy-token")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(global_domain.status(), StatusCode::OK);
+                let global_body = to_bytes(global_domain.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                let global_result: crate::domain::DataDeletionResult =
+                        serde_json::from_slice(&global_body).unwrap();
+                assert_eq!(global_result.flows_redacted, 1);
+
+                let invalid_domain = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .method("DELETE")
+                                        .uri("/api/v1/domains/-bad.example")
+                                        .header(header::COOKIE, &csrf_cookie)
+                                        .header("x-csrf-token", "privacy-token")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(invalid_domain.status(), StatusCode::BAD_REQUEST);
+
+                let invalid_range = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .method("DELETE")
+                                        .uri("/api/v1/data?from_ms=200&to_ms=100")
+                                        .header(header::COOKIE, &csrf_cookie)
+                                        .header("x-csrf-token", "privacy-token")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(invalid_range.status(), StatusCode::BAD_REQUEST);
+
+                let deleted_range = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .method("DELETE")
+                                        .uri(format!(
+                                                "/api/v1/data?from_ms={}&to_ms={}",
+                                                flow_time.saturating_sub(1),
+                                                flow_time.saturating_add(1)
+                                        ))
+                                        .header(header::COOKIE, &csrf_cookie)
+                                        .header("x-csrf-token", "privacy-token")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(deleted_range.status(), StatusCode::OK);
+                assert!(repo
+                        .list_flow_page(&mac, i64::MIN, None, domain::FlowPageDirection::Older, 1,)
+                        .unwrap()
+                        .is_empty());
+                assert!(repo.find_device(&mac).unwrap().is_some());
+
+                let deleted_device = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .method("DELETE")
+                                        .uri(format!("/api/v1/devices/{mac}"))
+                                        .header(header::COOKIE, &csrf_cookie)
+                                        .header("x-csrf-token", "privacy-token")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(deleted_device.status(), StatusCode::OK);
+                assert!(repo.find_device(&mac).unwrap().is_none());
+
+                let missing = application
+                        .oneshot(
+                                Request::builder()
+                                        .method("DELETE")
+                                        .uri(format!("/api/v1/devices/{mac}"))
+                                        .header(header::COOKIE, &csrf_cookie)
+                                        .header("x-csrf-token", "privacy-token")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn privacy_web_page_renders_controls_and_forms_redirect_after_deletion() {
+                let repo = Arc::new(SqliteRepository::open_in_memory().unwrap());
+                let observation = Arc::new(ObservationService::new(Arc::clone(&repo), 24, 30));
+                let mut flow = SimulatedCollector::new().collect().unwrap().flows[0].clone();
+                flow.flow_id = "privacy-web-flow".to_owned();
+                let mac = flow.client_mac.clone();
+                let domain = flow.domain.as_ref().unwrap().domain.clone();
+                observation.ingest_flows(&[flow]).unwrap();
+                let auth = Arc::new(
+                        AuthService::from_repository(Arc::clone(&repo), "admin".to_owned(), None)
+                                .unwrap(),
+                );
+                let application = app(AppState {
+                        observation,
+                        auth,
+                        collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dns_cache: Arc::new(DnsAttributionCache::new()),
+                        dev_bypass_auth: true,
+                        secure_cookies: false,
+                });
+
+                let privacy = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri("/privacy")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(privacy.status(), StatusCode::OK);
+                let privacy_body = to_bytes(privacy.into_body(), usize::MAX).await.unwrap();
+                let privacy_html = String::from_utf8(privacy_body.to_vec()).unwrap();
+                assert!(privacy_html.contains("F3 Privacy"));
+                assert!(privacy_html.contains("/privacy/domains/delete"));
+                assert!(privacy_html.contains("/privacy/range/delete"));
+
+                let detail = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri(format!("/devices/{mac}"))
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                let detail_body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
+                let detail_html = String::from_utf8(detail_body.to_vec()).unwrap();
+                assert!(detail_html.contains("[forget]"));
+                assert!(detail_html.contains("[delete device]"));
+
+                let csrf_cookie = format!("{}=privacy-web-token", auth::CSRF_COOKIE_NAME);
+                let form_body = format!("csrf_token=privacy-web-token&domain={domain}");
+                let deleted = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .method("POST")
+                                        .uri(format!("/privacy/devices/{mac}/domains/delete"))
+                                        .header(header::COOKIE, &csrf_cookie)
+                                        .header(
+                                                header::CONTENT_TYPE,
+                                                "application/x-www-form-urlencoded",
+                                        )
+                                        .body(Body::from(form_body))
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+                assert!(deleted
+                        .headers()
+                        .get(header::LOCATION)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with("/privacy?result=device-domain&changes="));
+
+                let invalid_range = application
+                        .oneshot(
+                                Request::builder()
+                                        .method("POST")
+                                        .uri("/privacy/range/delete")
+                                        .header(header::COOKIE, &csrf_cookie)
+                                        .header(
+                                                header::CONTENT_TYPE,
+                                                "application/x-www-form-urlencoded",
+                                        )
+                                        .body(Body::from(
+                                                "csrf_token=privacy-web-token&from_ms=&to_ms=",
+                                        ))
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(invalid_range.status(), StatusCode::BAD_REQUEST);
         }
 }

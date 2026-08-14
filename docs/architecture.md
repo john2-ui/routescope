@@ -19,7 +19,7 @@ RouteScope 是一个部署在 Linux 软路由上的网络流量观测与统计�
 
 ### 1.2 首版范围与非目标
 
-首版是只读观测产品，提供实时视图、历史查询和设备/域名 Top 统计；不提供限流、阻断、告警或自动化策略执行。
+首版是观测产品，提供实时视图、历史查询、设备/域名 Top 与本地元数据管理；不提供限流、阻断、告警或自动化策略执行。
 
 首版网络范围限定为 IPv4 LAN 经 NAT 访问单 WAN 的常见家庭网络。IPv6、PPPoE 与多 WAN 不作为首版验收条件，但数据模型和接口命名不得假定它们永远不存在。
 
@@ -123,7 +123,7 @@ flowchart LR
             DOMAIN_JOIN["域名关联器<br/>按 MAC + target IP + TTL<br/>记录 domain_source / confidence"]
             REALTIME["实时统计视图<br/>设备 / Flow / 域名 Top"]
             SQLITE["SQLite 持久化<br/>Flow 连接明细：24h<br/>设备 / 域名分钟聚合：30d"]
-            API["观测只读 API / Web UI<br/>设备、Flow、域名 Top 查询<br/>设备名称管理"]
+            API["观测与管理 API / Web UI<br/>设备、Flow、域名 Top 查询<br/>设备名称与隐私删除"]
 
             BPF_MAPS --> EVENT_PIPE --> COLLECTOR
             CT_EXPORT --> COLLECTOR
@@ -187,10 +187,10 @@ LAN 接口（唯一计费点）
    └── Rust collector / 观测服务
           ├── 校验 Flow、关联 NAT 与连接状态
           ├── 设备识别：MAC 主键；DHCP / ARP / 手动名称仅作展示
-          ├── 双向 Flow 聚合与域名关联
+          ├── 双向 Flow 聚合、域名关联与晚到 DNS 幂等回填
           ├── 实时统计视图
           ├── SQLite：Flow 明细 24h；设备 / 域名分钟聚合 30d
-          └── 只读 API / Web UI（仅管理网或 LAN）
+          └── 观测与管理 API / Web UI（仅管理网或 LAN）
 ```
 
 ## 5. 流量记录模型
@@ -318,16 +318,19 @@ TCP、UDP、DNS 与大流量双向传输
 - 可查看每台设备按流量排序的域名 Top，且未知或低置信度关联必须清晰标识；
 - 可查询最近 30 天的分钟级设备和域名聚合趋势。
 
-### 验收后的后续优先级
+### 验收后的业务完成状态
 
-已完成域名分钟趋势查询、DNS 设备身份稳定关联和 Flow 查询分页：API 可按设备与
-域名返回 30 天的原始分钟桶；DNS binding 使用 MAC 身份；Flow API 使用 1/6/24 小时
-时间窗和 `(last_seen, flow_id)` 双向 keyset cursor，默认 50 条且最多 500 条。
+已完成域名分钟趋势查询、DNS 设备身份稳定关联、Flow 查询分页和延迟域名归因回填：
+API 可按设备与域名返回 30 天的原始分钟桶；DNS binding 使用 MAC 身份；Flow API 使用
+1/6/24 小时时间窗和 `(last_seen, flow_id)` 双向 keyset cursor，默认 50 条且最多 500 条。
+每个 Flow 的分钟计数增量写入内部贡献账本；DNS 晚到时按 MAC、目标 IP 与时间区间查找
+已落库 Flow，将未知归因或低置信度 SNI 幂等修正到 DNS 域名，并同步修正历史分钟聚合。
 
-1. **P2：延迟域名归因回填**
-   DNS 观察晚于 Flow 写入时，之前已写入的字节不会回填到域名聚合，需要设计可幂等的归因更新和聚合修正。
-2. **P2：敏感元数据主动删除**
-   当前只有按时间保留期清理，仍需提供按设备、域名或数据范围删除的管理能力。
+敏感元数据主动删除也已完成：管理员可删除完整设备、单设备或全局域名归因，以及任意
+半开时间区间 `[from_ms, to_ms)` 内的数据；SQLite 与 DNS 内存状态同步清理。
+
+当前文档中列出的 P1/P2 业务项已全部完成。限流、阻断和告警仍属于后续产品演进，
+不进入当前观测版本。
 
 ## 9. 性能演进策略
 
@@ -354,17 +357,21 @@ TC eBPF + conntrack + 用户态聚合
 - Flow 连接明细保存 24 小时，随后删除；
 - 设备和域名分钟级聚合保存 30 天，随后删除；
 - 到期清理任务应定期执行、可观测且可安全重试；
-- 对 MAC、IP、域名等敏感元数据提供删除能力；
+- 对 MAC、IP、域名等敏感元数据提供一次性硬删除能力；删除后不持久化排除规则，后续
+  新观测可以重新产生记录；
 - 所有 DNS/SNI 域名关联均标注数据来源与可信度。
 
 ## 11. 当前项目文件结构
 
-当前代码已实现领域模型、SQLite 持久化、分钟聚合、观测只读 API、设备名称管理和可选模拟采集，
+当前代码已实现领域模型、SQLite 持久化、分钟聚合、观测查询 API、设备名称与隐私管理和可选模拟采集，
 第一版 TC eBPF IPv4 TCP/UDP 双向 Flow 统计、只读 conntrack NAT 关联，以及可选
 的本地 DNS UDP/TCP 转发和基于 Flow 时间区间解析稳定 MAC 身份的 IPv4 A 记录域名归因；
 本地管理员账户认证、会话和 CSRF 防护也已落地。域名分钟聚合可通过 API 查询，
 并在 htop 风格设备详情页中按 24 小时或 30 天窗口查看。Flow 明细使用数据库级
 时间窗、复合索引与双向 cursor 分页，概览统计由 SQL 直接聚合，不再加载全部 Flow。
+晚到的 DNS binding 由 DNS 循环投递给观测服务，SQLite v3 的 Flow 分钟贡献账本负责
+幂等回填及低置信度域名聚合修正。F3 Privacy 管理页和受 CSRF 保护的删除 API 支持
+设备、设备内/全局域名与时间范围硬删除，并同步清理 DNS 内存状态。
 
 ```text
 .
@@ -380,7 +387,7 @@ TC eBPF + conntrack + 用户态聚合
 ├── src/
 │   ├── main.rs                 # 服务启动、路由组装和路由测试
 │   ├── api/
-│   │   └── mod.rs              # 健康检查与受保护的只读 API 路由
+│   │   └── mod.rs              # 健康检查、观测查询与数据删除 API
 │   ├── auth.rs                 # 本地账户、Argon2id、会话、CSRF 与限速
 │   ├── collector.rs            # 真实采集接口与模拟采集器
 │   ├── conntrack.rs            # conntrack netlink 快照与 NAT 关联
@@ -390,16 +397,17 @@ TC eBPF + conntrack + 用户态聚合
 │   ├── build.rs                # 编译 TC eBPF 对象文件
 │   ├── config.rs               # 监听地址和保留期配置
 │   ├── domain.rs               # Device、Flow、域名归因领域模型
-│   ├── service.rs              # 观测查询、Flow 写入与清理
-│   ├── storage.rs              # SQLite 仓储、Flow keyset 分页、聚合与清理
-│   └── web.rs                  # 真实观测页面、设备命名和静态资源路由
+│   ├── service.rs              # 观测查询、Flow 写入、域名回填与删除
+│   ├── storage.rs              # SQLite 仓储、Flow 分页、贡献账本、聚合与删除
+│   └── web.rs                  # 观测页面、设备命名、隐私管理和静态资源路由
 ├── scripts/
 │   └── namespace_lab.sh        # namespace 拓扑与 NAT smoke test
 ├── templates/
 │   ├── login.html              # 登录页面
 │   ├── dashboard.html          # 设备概览与实时统计
 │   ├── devices.html            # 设备列表与手动命名
-│   └── device_detail.html      # Flow、趋势与域名 Top
+│   ├── device_detail.html      # Flow、趋势、域名 Top 与设备删除
+│   └── privacy.html            # 全局域名与时间范围删除
 └── static/
     └── app.css                 # 最小管理界面样式
 ```
@@ -408,7 +416,7 @@ TC eBPF + conntrack + 用户态聚合
 采集器是否已完成启动；运行中的采集失败会让就绪状态降级。管理页面和 `/api/v1/*` 均由本地会话认证中间件保护，
 登录 POST/登出 POST/设备命名 POST 均要求 CSRF 校验。开发绕过只接受 loopback 监听地址。
 
-SQLite 使用 `PRAGMA user_version` 记录 schema 版本。打开数据库时会在事务中执行尚未
+SQLite 使用 `PRAGMA user_version` 记录 schema 版本，当前为 v3。打开数据库时会在事务中执行尚未
 应用的迁移，并启用 WAL、忙等待与 `synchronous=NORMAL`；Flow 批次使用单事务写入，
 避免每条 Flow 单独获取锁和提交。
 

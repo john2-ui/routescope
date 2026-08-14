@@ -271,6 +271,42 @@ button {
 }
 .inline-form input { flex: 1; }
 
+.compact-form { margin: 0; }
+.compact-form input[type="hidden"] { display: none; }
+.danger-button {
+  background: transparent;
+  border-color: var(--red);
+  color: var(--red);
+  white-space: nowrap;
+}
+.danger-button:hover { background: var(--red); color: var(--bg); }
+.danger-zone { border-color: var(--red); }
+.danger-zone .terminal-title { background: #35151a; color: var(--red); }
+.danger-row {
+  align-items: center;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+  padding: .6rem;
+}
+.danger-row p { margin: 0; }
+.privacy-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.privacy-grid > :last-child,
+.privacy-grid > .result-line { grid-column: 1 / -1; }
+.privacy-form { display: grid; gap: .6rem; padding: .65rem; }
+.privacy-form label {
+  align-items: center;
+  display: grid;
+  gap: .6rem;
+  grid-template-columns: 90px 1fr;
+}
+.privacy-form label span { color: var(--cyan); }
+.privacy-form p,
+.privacy-notes p { color: var(--muted); margin: 0; }
+.privacy-form button { justify-self: start; }
+.privacy-notes { display: grid; gap: .5rem; padding: .65rem; }
+.result-line { color: var(--green); padding: .55rem; }
+
 .keybar {
   background: #102a2a;
   border-top: 1px solid var(--line-bright);
@@ -333,6 +369,7 @@ button {
   .meter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .traffic-row { grid-template-columns: 125px minmax(90px, 1fr) 75px; }
   .traffic-row small { display: none; }
+  .privacy-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 520px) {
@@ -342,5 +379,7 @@ button {
   .terminal-form label { align-items: stretch; grid-template-columns: 1fr; }
   .terminal-form button { margin-left: 0; }
   .traffic-row { grid-template-columns: 105px minmax(70px, 1fr) 65px; }
+  .danger-row { align-items: stretch; flex-direction: column; }
+  .privacy-form label { align-items: stretch; grid-template-columns: 1fr; }
   .keybar { overflow-x: auto; white-space: nowrap; }
 }

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>privacy · RouteScope</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="terminal-header">
+    <a class="brand" href="/">RouteScope</a>
+    <span class="header-context">privacy</span>
+    <span class="header-spacer"></span>
+    <span class="status status-{{ collector_status }}">[collector: {{ collector_status }}]</span>
+    <nav aria-label="主导航"><a href="/">F1 Overview</a><a href="/devices">F2 Devices</a><a class="active" href="/privacy">F3 Privacy</a></nav>
+    <form method="post" action="/logout" class="logout-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit">F10 Quit</button>
+    </form>
+  </header>
+  <main class="terminal-main privacy-grid">
+    {% if !result_message.is_empty() %}
+    <section class="terminal-window result-line" aria-live="polite">[ok] {{ result_message }}</section>
+    {% endif %}
+
+    <section class="terminal-window danger-zone">
+      <div class="terminal-title"><span>[ forget domain / all devices ]</span><span>irreversible</span></div>
+      <form method="post" action="/privacy/domains/delete" class="privacy-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label><span>domain</span><input name="domain" required maxlength="253" placeholder="example.com" autocomplete="off"></label>
+        <p>Clears this domain from every Flow and deletes its domain-minute history. Device totals remain.</p>
+        <button class="danger-button" type="submit">[delete global domain data]</button>
+      </form>
+    </section>
+
+    <section class="terminal-window danger-zone">
+      <div class="terminal-title"><span>[ delete time range ]</span><span>[from_ms, to_ms)</span></div>
+      <form method="post" action="/privacy/range/delete" class="privacy-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label><span>from_ms</span><input name="from_ms" inputmode="numeric" pattern="[0-9]*" placeholder="optional Unix milliseconds"></label>
+        <label><span>to_ms</span><input name="to_ms" inputmode="numeric" pattern="[0-9]*" placeholder="optional Unix milliseconds"></label>
+        <p>At least one boundary is required. Intersecting Flow rows are removed completely; device aliases remain.</p>
+        <button class="danger-button" type="submit">[delete selected range]</button>
+      </form>
+    </section>
+
+    <section class="terminal-window">
+      <div class="terminal-title"><span>[ deletion semantics ]</span><span>one-shot purge</span></div>
+      <div class="privacy-notes">
+        <p>Deletion cannot be undone and is not written to a persistent audit log.</p>
+        <p>RouteScope does not create exclusion rules. A running collector may create new records after this operation.</p>
+        <p>To delete one device or one device/domain pair, open the relevant device detail page.</p>
+      </div>
+    </section>
+  </main>
+  <footer class="keybar"><a href="/">F1 Overview</a><a href="/devices">F2 Devices</a><a href="/privacy">F3 Privacy</a><span>F5 Refresh</span><span>F10 Quit</span></footer>
+</body>
+</html>
