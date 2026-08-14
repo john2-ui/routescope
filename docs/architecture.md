@@ -104,7 +104,7 @@ flowchart LR
             DNS_MATCH["DNS 识别 / redirect<br/>nftables：UDP/TCP 53"]
             DNS_PROXY["本地 DNS 代理<br/>按客户端接收与转发查询"]
             DNS_UP["上游 DNS resolver"]
-            DNS_CACHE["短期关联缓存<br/>client IP/MAC → domain → target IP<br/>TTL、时间窗、source、confidence"]
+            DNS_CACHE["短期关联缓存<br/>Flow 时间区间解析 IP → MAC<br/>MAC + target IP → domain（TTL）"]
 
             DNS_MATCH --> DNS_PROXY
             DNS_PROXY -->|查询| DNS_UP
@@ -120,7 +120,7 @@ flowchart LR
             COLLECTOR["Rust collector<br/>校验 Flow、关联 NAT 与状态"]
             DEVICE_ID["设备身份解析<br/>MAC 为稳定主键<br/>DHCP / ARP / 手动名称"]
             FLOW_AGG["双向 Flow 聚合器<br/>五元组、上下行计数、NAT 映射<br/>字节数、包数、首末时间"]
-            DOMAIN_JOIN["域名关联器<br/>按 client + target IP + TTL<br/>记录 domain_source / confidence"]
+            DOMAIN_JOIN["域名关联器<br/>按 MAC + target IP + TTL<br/>记录 domain_source / confidence"]
             REALTIME["实时统计视图<br/>设备 / Flow / 域名 Top"]
             SQLITE["SQLite 持久化<br/>Flow 连接明细：24h<br/>设备 / 域名分钟聚合：30d"]
             API["观测只读 API / Web UI<br/>设备、Flow、域名 Top 查询<br/>设备名称管理"]
@@ -232,14 +232,18 @@ TC eBPF 只在 LAN 侧累计字节，WAN 侧不重复计费；conntrack 只负�
 RouteScope 优先通过本地 DNS 代理获得域名关联：
 
 1. 将 LAN 客户端 DNS 请求重定向到网关 DNS 代理；
-2. 记录客户端、查询域名、返回 IP 与 TTL；
-3. Flow 命中目标 IP 时，按客户端和有效期关联域名；
-4. 可选解析 TLS/QUIC ClientHello 的 SNI 作为补充。
+2. 记录客户端 IP、查询域名、返回 IP、观察时间与 TTL；
+3. 从 Flow 的时间区间建立短期 IP→MAC 身份快照，只有候选 MAC 唯一时才生成
+   `(client_mac, target_ip)` 正式 binding；
+4. DNS 先于身份 Flow 到达时，观察在 TTL 或 5 分钟中较短的时间内暂存重试；
+   超过 4096 条时淘汰最旧项；
+5. Flow 命中目标 IP 时，按规范化 MAC、TTL 和现有时间窗关联域名；
+6. 可选解析 TLS/QUIC ClientHello 的 SNI 作为补充。
 
 域名信息以尽力而为的方式呈现：
 
 - `domain_source` 至少区分 DNS、SNI 与未知；
-- `domain_confidence` 标记关联可靠程度，DNS 按客户端与 TTL 命中的记录可标为高，SNI 或共享 IP 推断应降低置信度；
+- `domain_confidence` 标记关联可靠程度，DNS 按唯一 MAC、目标 IP 与 TTL 命中的记录可标为高，SNI 或共享 IP 推断应降低置信度；
 - 无法可靠归因的连接显示为“未知”，不得猜测或伪装为精确网站访问记录；
 - 设备域名 Top 以域名和字节数聚合，并保留来源与置信度供界面说明。
 
@@ -316,16 +320,13 @@ TCP、UDP、DNS 与大流量双向传输
 
 ### 验收后的后续优先级
 
-域名分钟趋势查询已经完成：API 可按设备与域名返回 30 天保留窗口内的原始分钟桶，
-设备详情页提供 24 小时和 30 天趋势视图。
+已完成域名分钟趋势查询、DNS 设备身份稳定关联和 Flow 查询分页：API 可按设备与
+域名返回 30 天的原始分钟桶；DNS binding 使用 MAC 身份；Flow API 使用 1/6/24 小时
+时间窗和 `(last_seen, flow_id)` 双向 keyset cursor，默认 50 条且最多 500 条。
 
-1. **P1：DNS 设备身份稳定关联**
-   当前 DNS 缓存使用客户端 IP，需补充 IP 到 MAC 的快照关联，降低 DHCP 地址复用带来的错误归因风险。
-2. **P1：Flow 查询分页和上限**
-   当前设备 Flow 查询可能返回 24 小时内的全部记录，需要增加数据库 LIMIT、时间窗和分页游标。
-3. **P2：延迟域名归因回填**
+1. **P2：延迟域名归因回填**
    DNS 观察晚于 Flow 写入时，之前已写入的字节不会回填到域名聚合，需要设计可幂等的归因更新和聚合修正。
-4. **P2：敏感元数据主动删除**
+2. **P2：敏感元数据主动删除**
    当前只有按时间保留期清理，仍需提供按设备、域名或数据范围删除的管理能力。
 
 ## 9. 性能演进策略
@@ -360,9 +361,10 @@ TC eBPF + conntrack + 用户态聚合
 
 当前代码已实现领域模型、SQLite 持久化、分钟聚合、观测只读 API、设备名称管理和可选模拟采集，
 第一版 TC eBPF IPv4 TCP/UDP 双向 Flow 统计、只读 conntrack NAT 关联，以及可选
-的本地 DNS UDP/TCP 转发和 IPv4 A 记录域名归因；本地管理员账户认证、会话和 CSRF
-防护也已落地。域名分钟聚合可通过 API 查询，并在 htop 风格设备详情页中按 24 小时或
-30 天窗口查看。
+的本地 DNS UDP/TCP 转发和基于 Flow 时间区间解析稳定 MAC 身份的 IPv4 A 记录域名归因；
+本地管理员账户认证、会话和 CSRF 防护也已落地。域名分钟聚合可通过 API 查询，
+并在 htop 风格设备详情页中按 24 小时或 30 天窗口查看。Flow 明细使用数据库级
+时间窗、复合索引与双向 cursor 分页，概览统计由 SQL 直接聚合，不再加载全部 Flow。
 
 ```text
 .
@@ -382,14 +384,14 @@ TC eBPF + conntrack + 用户态聚合
 │   ├── auth.rs                 # 本地账户、Argon2id、会话、CSRF 与限速
 │   ├── collector.rs            # 真实采集接口与模拟采集器
 │   ├── conntrack.rs            # conntrack netlink 快照与 NAT 关联
-│   ├── dns.rs                  # DNS observation 队列、TTL 缓存与 Flow 域名归因
+│   ├── dns.rs                  # DNS 待解析队列、MAC 身份缓存与 Flow 域名归因
 │   ├── dns_proxy.rs            # 本地 DNS UDP/TCP 转发与 A 记录解析
 │   ├── routescope_tc.c         # TC eBPF IPv4 TCP/UDP 统计程序
 │   ├── build.rs                # 编译 TC eBPF 对象文件
 │   ├── config.rs               # 监听地址和保留期配置
 │   ├── domain.rs               # Device、Flow、域名归因领域模型
 │   ├── service.rs              # 观测查询、Flow 写入与清理
-│   ├── storage.rs              # SQLite 仓储、聚合与清理
+│   ├── storage.rs              # SQLite 仓储、Flow keyset 分页、聚合与清理
 │   └── web.rs                  # 真实观测页面、设备命名和静态资源路由
 ├── scripts/
 │   └── namespace_lab.sh        # namespace 拓扑与 NAT smoke test

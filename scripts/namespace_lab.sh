@@ -423,7 +423,8 @@ import json
 import sys
 
 mac, protocol, destination_port = sys.argv[1], sys.argv[2], int(sys.argv[3])
-data = json.load(sys.stdin)
+page = json.load(sys.stdin)
+data = page["items"]
 matches = [
     flow for flow in data
     if flow["client_mac"] == mac
@@ -482,7 +483,8 @@ import json
 import sys
 
 mac, expected_bytes = sys.argv[1], int(sys.argv[2])
-data = json.load(sys.stdin)
+page = json.load(sys.stdin)
+data = page["items"]
 matches = [
     flow for flow in data
     if flow["client_mac"] == mac
@@ -525,7 +527,7 @@ import json
 import sys
 
 rx_before, tx_before, rx_after, tx_after = map(int, sys.argv[1:5])
-flows = json.loads(sys.argv[5]) + json.loads(sys.argv[6])
+flows = json.loads(sys.argv[5])["items"] + json.loads(sys.argv[6])["items"]
 upload_bytes = sum(flow["upload_bytes"] for flow in flows)
 download_bytes = sum(flow["download_bytes"] for flow in flows)
 rx_delta = rx_after - rx_before

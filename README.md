@@ -8,7 +8,9 @@ Linux 软路由流量观测与统计工具。
 设备名称管理以及可选的模拟采集闭环。第一版 TC eBPF 采集器已经接入，可在 Linux namespace
 拓扑中采集 LAN ingress/egress 上的 IPv4 TCP/UDP 双向 Flow，并可选通过只读
 conntrack netlink 快照补齐 NAT 关联；可选的本地 DNS UDP/TCP 转发与 IPv4 域名归因
-已经接入，本地管理员账户认证、会话和 CSRF 防护也已经接入。管理页面采用紧凑的
+已经接入。DNS 观察通过 Flow 时间区间解析到稳定 MAC 身份；无法唯一确认时会暂存并
+重试，不会按可复用的客户端 IP 猜测。本地管理员账户认证、会话和 CSRF 防护也已经接入。
+管理页面采用紧凑的
 htop/Linux 终端风格，并支持查询单设备、单域名最近 30 天的分钟流量趋势。
 
 - `GET /healthz` 可用于健康检查；
@@ -36,6 +38,9 @@ htop/Linux 终端风格，并支持查询单设备、单域名最近 30 天的�
   `POST /api/v1/devices/<mac>/name`（需要 `X-CSRF-Token`）。
 - `GET /api/v1/devices/<mac>/domains/<domain>/traffic` 返回聚合保留期内按时间升序排列的
   原始域名分钟桶；设备详情页可从域名 Top 进入 24 小时或 30 天趋势视图。
+- `GET /api/v1/devices/<mac>/flows?window=24h&limit=50` 按 `1h`/`6h`/`24h`
+  时间窗返回 Flow 分页对象，包含 `items`、`next_cursor`、`previous_cursor`、
+  `window`、`since_ms` 和 `limit`；继续翻页时仅传 `cursor`。默认 50 条，最多 500 条。
 - SQLite 使用 `PRAGMA user_version` 执行 schema 迁移，Flow 批次在单事务中写入；可用
   `make benchmark` 或 `cargo run --release -- benchmark-storage 10000` 做离线写入基准。
 - 收到 SIGINT/SIGTERM 后会停止采集、DNS、清理后台任务并等待 HTTP 连接，超时由
@@ -64,6 +69,18 @@ make test
 make clippy
 make benchmark
 ```
+
+大量 Flow 分页联调（默认生成 1500 条到独立数据库，监听 `127.0.0.1:8081`）：
+
+```bash
+make flow-demo
+# 打开 http://127.0.0.1:8081/devices/de:ad:be:ef:00:01
+```
+
+脚本会先验证 1/6/24 小时时间窗、50 条页上限和双向 cursor，再保持服务运行供网页
+检查。仅执行自动验证可用 `make flow-demo-check`。可通过
+`ROUTESCOPE_FLOW_DEMO_COUNT`、`ROUTESCOPE_FLOW_DEMO_DB` 和
+`ROUTESCOPE_FLOW_DEMO_LISTEN_ADDR` 覆盖数量、数据库和监听地址。
 
 跨架构编译 eBPF 对象时，`build.rs` 默认从 Cargo target 推导架构，也可显式设置
 `ROUTESCOPE_BPF_TARGET_ARCH=arm64` 等值；clang 路径仍可通过
@@ -96,13 +113,13 @@ src/api/       HTTP API 路由
 src/auth.rs    本地账户、Argon2id、会话、CSRF 与限速
 src/collector.rs TC eBPF、采集管线与模拟采集器
 src/conntrack.rs conntrack netlink 快照与 NAT 关联
-src/dns.rs     DNS observation 队列、TTL 缓存与 Flow 域名归因
+src/dns.rs     DNS observation 待解析队列、MAC 身份缓存与 Flow 域名归因
 src/dns_proxy.rs 本地 DNS UDP/TCP 转发与 A 记录解析
 src/routescope_tc.c TC eBPF IPv4 TCP/UDP 统计程序
 build.rs          编译 TC eBPF 对象文件
 src/domain.rs  Device、Flow 和域名归因领域模型
 src/service.rs 观测查询、Flow 写入和保留期清理
-src/storage.rs SQLite 仓储、分钟聚合与清理
+src/storage.rs SQLite 仓储、Flow keyset 分页、分钟聚合与清理
 src/web.rs     服务端渲染页面与静态资源路由
 scripts/namespace_lab.sh namespace 拓扑创建、清理和 smoke test
 scripts/dns_test_server.py 确定性 UDP/TCP DNS 上游测试服务

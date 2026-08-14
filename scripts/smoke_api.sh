@@ -98,7 +98,9 @@ flows_json="$(curl -sf "$BASE_URL/api/v1/devices/${MAC_LAPTOP}/flows")"
 echo "$flows_json"
 echo "$flows_json" | python3 -c '
 import json, sys
-data = json.load(sys.stdin)
+page = json.load(sys.stdin)
+data = page["items"]
+assert page["window"] == "24h" and page["limit"] == 50, page
 assert len(data) >= 1, data
 assert data[0]["domain"]["domain"] == "example.com", data
 print("ok: laptop flows with domain attribution")
@@ -109,7 +111,8 @@ phone_flows="$(curl -sf "$BASE_URL/api/v1/devices/${MAC_PHONE}/flows")"
 echo "$phone_flows"
 echo "$phone_flows" | python3 -c '
 import json, sys
-data = json.load(sys.stdin)
+page = json.load(sys.stdin)
+data = page["items"]
 assert len(data) >= 1, data
 assert data[0]["domain"] is None, data
 print("ok: phone flow without domain")

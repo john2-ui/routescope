@@ -1,4 +1,4 @@
-.PHONY: run check test fmt clippy benchmark seed smoke namespace-up namespace-down namespace-status namespace-test namespace-collector-test namespace-dns-test
+.PHONY: run check test fmt clippy benchmark seed smoke flow-demo flow-demo-check namespace-up namespace-down namespace-status namespace-test namespace-collector-test namespace-dns-test
 
 run:
 	set -a && [ -f .env ] && . ./.env; set +a; cargo run
@@ -23,6 +23,12 @@ seed:
 
 smoke:
 	bash scripts/smoke_api.sh
+
+flow-demo:
+	bash scripts/flow_pagination_demo.sh
+
+flow-demo-check:
+	bash scripts/flow_pagination_demo.sh --check
 
 namespace-up:
 	scripts/namespace_lab.sh up

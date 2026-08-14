@@ -223,6 +223,20 @@ nav a.active,
 .chart-meta { color: var(--muted); margin: 0; padding: .35rem .55rem 0; }
 .window-tabs { display: flex; gap: .45rem; }
 .window-tabs .active { background: var(--cyan); color: var(--bg); padding: 0 .2rem; }
+.flow-pager {
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  gap: .55rem;
+  min-height: 26px;
+  padding: .2rem .55rem;
+}
+.flow-pager a { color: var(--cyan); }
+.flow-pager .active { background: var(--cyan); color: var(--bg); padding: 0 .2rem; }
+.flow-pager .disabled,
+.flow-pager > :last-child { color: var(--muted); }
+.flow-pager > :last-child { margin-left: auto; }
 
 .empty-state { padding-bottom: 1rem; text-align: center; }
 .empty-state p,

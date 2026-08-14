@@ -255,7 +255,7 @@ fn refresh_dns_attribution(
         dns_source: &dyn DnsObservationSource,
         now_ms: i64,
 ) {
-        if let Err(error) = dns_cache.collect_from(dns_source) {
+        if let Err(error) = dns_cache.collect_from(dns_source, now_ms) {
                 eprintln!(
                         "DNS source {} failed to collect observations: {error}",
                         dns_source.source_name()
@@ -314,7 +314,9 @@ async fn run_collection_loop(
 
                 match collector.collect() {
                         Ok(mut batch) => {
-                                // Fresh drain immediately before attribution for lower latency.
+                                // Learn the stable MAC identity before draining DNS so fresh
+                                // observations can be bound without relying on reusable client IPs.
+                                dns_cache.learn_flow_identities(&batch.flows, batch.observed_at_ms);
                                 refresh_dns_attribution(
                                         dns_cache.as_ref(),
                                         dns_source.as_ref(),
@@ -770,6 +772,150 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn flow_api_returns_bounded_cursor_pages_and_validates_queries() {
+                let repo = Arc::new(SqliteRepository::open_in_memory().unwrap());
+                let observation = Arc::new(ObservationService::new(Arc::clone(&repo), 24, 30));
+                let batch = SimulatedCollector::new().collect().unwrap();
+                let mac = batch.flows[0].client_mac.clone();
+                let mut flows = Vec::new();
+                for index in 0..3 {
+                        let mut flow = batch.flows[0].clone();
+                        flow.flow_id = format!("api-page-{index}");
+                        flow.last_seen = flow.last_seen.saturating_sub(index * 1_000);
+                        flow.first_seen = flow.last_seen.saturating_sub(500);
+                        flows.push(flow);
+                }
+                observation.ingest_flows(&flows).unwrap();
+                repo.upsert_device(&crate::domain::Device {
+                        mac_address: "00:00:00:00:00:01".to_owned(),
+                        display_name: None,
+                        current_ip: None,
+                })
+                .unwrap();
+                let auth = Arc::new(
+                        AuthService::from_repository(Arc::clone(&repo), "admin".to_owned(), None)
+                                .unwrap(),
+                );
+                let application = app(AppState {
+                        observation,
+                        auth,
+                        collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dev_bypass_auth: true,
+                        secure_cookies: false,
+                });
+
+                let first = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri(format!(
+                                                "/api/v1/devices/{mac}/flows?window=1h&limit=1"
+                                        ))
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(first.status(), StatusCode::OK);
+                let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+                let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+                assert_eq!(first_json["items"].as_array().unwrap().len(), 1);
+                assert_eq!(first_json["window"], "1h");
+                assert_eq!(first_json["limit"], 1);
+                assert!(first_json["previous_cursor"].is_null());
+                let next_cursor = first_json["next_cursor"].as_str().unwrap();
+
+                let defaults = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri(format!("/api/v1/devices/{mac}/flows"))
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                let defaults_body = to_bytes(defaults.into_body(), usize::MAX).await.unwrap();
+                let defaults_json: serde_json::Value =
+                        serde_json::from_slice(&defaults_body).unwrap();
+                assert_eq!(defaults_json["window"], "24h");
+                assert_eq!(defaults_json["limit"], 50);
+
+                let second = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri(format!(
+                                                "/api/v1/devices/{mac}/flows?cursor={next_cursor}"
+                                        ))
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(second.status(), StatusCode::OK);
+                let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+                let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+                assert_eq!(second_json["items"].as_array().unwrap().len(), 1);
+                assert!(second_json["previous_cursor"].is_string());
+
+                for uri in [
+                        format!("/api/v1/devices/{mac}/flows?window=2h"),
+                        format!("/api/v1/devices/{mac}/flows?limit=0"),
+                        format!("/api/v1/devices/{mac}/flows?limit=501"),
+                        format!("/api/v1/devices/{mac}/flows?cursor=invalid!"),
+                        format!("/api/v1/devices/{mac}/flows?window=24h&cursor={next_cursor}"),
+                ] {
+                        let response = application
+                                .clone()
+                                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                                .await
+                                .unwrap();
+                        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                }
+
+                let cross_device_cursor = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri(format!(
+                                                "/api/v1/devices/00:00:00:00:00:01/flows?cursor={next_cursor}"
+                                        ))
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(cross_device_cursor.status(), StatusCode::BAD_REQUEST);
+
+                let empty = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri("/api/v1/devices/00:00:00:00:00:01/flows")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(empty.status(), StatusCode::OK);
+                let empty_body = to_bytes(empty.into_body(), usize::MAX).await.unwrap();
+                let empty_json: serde_json::Value = serde_json::from_slice(&empty_body).unwrap();
+                assert_eq!(empty_json["items"], serde_json::json!([]));
+
+                let missing = application
+                        .oneshot(
+                                Request::builder()
+                                        .uri("/api/v1/devices/00:00:00:00:00:02/flows")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
         async fn domain_traffic_api_returns_raw_minutes_and_handles_empty_and_missing_devices() {
                 let repo = Arc::new(SqliteRepository::open_in_memory().unwrap());
                 let observation = Arc::new(ObservationService::new(Arc::clone(&repo), 24, 30));
@@ -888,7 +1034,8 @@ mod tests {
                 assert_eq!(detail.status(), StatusCode::OK);
                 let detail_body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
                 let detail_html = String::from_utf8(detail_body.to_vec()).unwrap();
-                assert!(detail_html.contains("flows / last 24h"));
+                assert!(detail_html.contains("flows / 24H"));
+                assert!(detail_html.contains("[FIRST]"));
                 assert!(detail_html.contains("example.com"));
 
                 let trend = application
@@ -934,5 +1081,93 @@ mod tests {
                         .await
                         .unwrap();
                 assert_eq!(invalid_window.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn device_detail_limits_flows_and_preserves_domain_query_in_pager() {
+                let repo = Arc::new(SqliteRepository::open_in_memory().unwrap());
+                let observation = Arc::new(ObservationService::new(Arc::clone(&repo), 24, 30));
+                let batch = SimulatedCollector::new().collect().unwrap();
+                let mac = batch.flows[0].client_mac.clone();
+                let mut flows = Vec::new();
+                for index in 0..51 {
+                        let mut flow = batch.flows[0].clone();
+                        flow.flow_id = format!("web-page-{index:02}");
+                        flow.last_seen = flow.last_seen.saturating_sub(index * 1_000);
+                        flow.first_seen = flow.last_seen.saturating_sub(500);
+                        flows.push(flow);
+                }
+                observation.ingest_flows(&flows).unwrap();
+                let older_cursor = observation
+                        .flow_page(&mac, Some("6h"), None, None)
+                        .unwrap()
+                        .next_cursor
+                        .unwrap();
+                let auth = Arc::new(
+                        AuthService::from_repository(Arc::clone(&repo), "admin".to_owned(), None)
+                                .unwrap(),
+                );
+                let application = app(AppState {
+                        observation,
+                        auth,
+                        collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dev_bypass_auth: true,
+                        secure_cookies: false,
+                });
+
+                let response = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri(format!(
+                                                "/devices/{mac}?domain=example.com&domain_window=30d&flow_window=6h"
+                                        ))
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let html = String::from_utf8(body.to_vec()).unwrap();
+                assert!(html.contains("flows / 6H"));
+                assert!(html.contains("<span class=\"active\">[6H]</span>"));
+                assert_eq!(html.matches(" packets</small>").count(), 50);
+                assert!(html.contains("domain=example.com"));
+                assert!(html.contains("domain_window=30d"));
+                assert!(html.contains("flow_cursor="));
+                assert!(html.contains("[OLDER]</a>"));
+                assert!(html.contains("flow_window=1h"));
+
+                let older_page = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri(format!(
+                                                "/devices/{mac}?domain=example.com&domain_window=30d&flow_cursor={older_cursor}"
+                                        ))
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(older_page.status(), StatusCode::OK);
+                let older_body = to_bytes(older_page.into_body(), usize::MAX).await.unwrap();
+                let older_html = String::from_utf8(older_body.to_vec()).unwrap();
+                assert_eq!(older_html.matches(" packets</small>").count(), 1);
+                assert!(older_html.contains("[FIRST]</a>"));
+                assert!(older_html.contains("[NEWER]</a>"));
+                assert!(older_html.contains("<span class=\"disabled\">[OLDER]</span>"));
+
+                let invalid = application
+                        .oneshot(
+                                Request::builder()
+                                        .uri(format!("/devices/{mac}?flow_window=2h"))
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
         }
 }

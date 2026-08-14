@@ -20,6 +20,7 @@ use crate::domain::{
         Device, DeviceMinuteStat, DomainMinuteStat, DomainTrafficSummary, Flow,
         normalize_display_name,
 };
+use crate::service::FlowQueryError;
 use crate::state::AppState;
 
 #[derive(Template)]
@@ -72,6 +73,19 @@ struct DeviceDetailTemplate {
         device_upload_meter: u8,
         device_download_meter: u8,
         flows: Vec<FlowRow>,
+        flow_window_label: String,
+        flow_1h_href: String,
+        flow_6h_href: String,
+        flow_24h_href: String,
+        flow_1h_active: bool,
+        flow_6h_active: bool,
+        flow_24h_active: bool,
+        flow_first_href: String,
+        flow_newer_href: String,
+        flow_older_href: String,
+        flow_first_active: bool,
+        flow_has_newer: bool,
+        flow_has_older: bool,
 }
 
 #[derive(Clone)]
@@ -158,6 +172,8 @@ impl DomainTrendWindow {
 struct DeviceDetailQuery {
         domain: Option<String>,
         domain_window: Option<String>,
+        flow_window: Option<String>,
+        flow_cursor: Option<String>,
 }
 
 struct FlowRow {
@@ -391,17 +407,29 @@ async fn device_detail(
         Query(query): Query<DeviceDetailQuery>,
         headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-        let domain_window = DomainTrendWindow::parse(query.domain_window.as_deref())?;
-        let selected_domain = query.domain.filter(|domain| !domain.is_empty());
+        let DeviceDetailQuery {
+                domain,
+                domain_window,
+                flow_window,
+                flow_cursor,
+        } = query;
+        let domain_window = DomainTrendWindow::parse(domain_window.as_deref())?;
+        let selected_domain = domain.filter(|domain| !domain.is_empty());
+        let flow_first_active = flow_cursor.is_none();
         let device = state
                 .observation
                 .device(&mac_address)
                 .map_err(service_error)?
                 .ok_or(StatusCode::NOT_FOUND)?;
-        let flows = state
+        let flow_page = state
                 .observation
-                .recent_flows(&mac_address)
-                .map_err(service_error)?;
+                .flow_page(
+                        &mac_address,
+                        flow_window.as_deref(),
+                        None,
+                        flow_cursor.as_deref(),
+                )
+                .map_err(flow_query_service_error)?;
         let traffic = state
                 .observation
                 .device_traffic(&mac_address)
@@ -435,6 +463,61 @@ async fn device_detail(
                 .as_deref()
                 .map(|domain| domain_trend_href(&mac_address, domain, DomainTrendWindow::Days30))
                 .unwrap_or_default();
+        let flow_window_name = flow_page.window.clone();
+        let flow_1h_href = flow_detail_href(
+                &mac_address,
+                selected_domain.as_deref(),
+                domain_window,
+                Some("1h"),
+                None,
+        );
+        let flow_6h_href = flow_detail_href(
+                &mac_address,
+                selected_domain.as_deref(),
+                domain_window,
+                Some("6h"),
+                None,
+        );
+        let flow_24h_href = flow_detail_href(
+                &mac_address,
+                selected_domain.as_deref(),
+                domain_window,
+                Some("24h"),
+                None,
+        );
+        let flow_first_href = flow_detail_href(
+                &mac_address,
+                selected_domain.as_deref(),
+                domain_window,
+                Some(&flow_window_name),
+                None,
+        );
+        let flow_newer_href = flow_page
+                .previous_cursor
+                .as_deref()
+                .map(|cursor| {
+                        flow_detail_href(
+                                &mac_address,
+                                selected_domain.as_deref(),
+                                domain_window,
+                                None,
+                                Some(cursor),
+                        )
+                })
+                .unwrap_or_default();
+        let flow_older_href = flow_page
+                .next_cursor
+                .as_deref()
+                .map(|cursor| {
+                        flow_detail_href(
+                                &mac_address,
+                                selected_domain.as_deref(),
+                                domain_window,
+                                None,
+                                Some(cursor),
+                        )
+                })
+                .unwrap_or_default();
 
         let csrf_token = page_csrf_token(&headers);
         render_page(
@@ -461,7 +544,20 @@ async fn device_detail(
                         device_total_meter,
                         device_upload_meter,
                         device_download_meter,
-                        flows: flows.into_iter().map(flow_row).collect(),
+                        flows: flow_page.items.into_iter().map(flow_row).collect(),
+                        flow_window_label: flow_window_name.to_ascii_uppercase(),
+                        flow_1h_href,
+                        flow_6h_href,
+                        flow_24h_href,
+                        flow_1h_active: flow_window_name == "1h",
+                        flow_6h_active: flow_window_name == "6h",
+                        flow_24h_active: flow_window_name == "24h",
+                        flow_first_href,
+                        flow_newer_href: flow_newer_href.clone(),
+                        flow_older_href: flow_older_href.clone(),
+                        flow_first_active,
+                        flow_has_newer: !flow_newer_href.is_empty(),
+                        flow_has_older: !flow_older_href.is_empty(),
                 },
                 &csrf_token,
         )
@@ -515,21 +611,14 @@ fn build_device_row(
         observation: &crate::service::ObservationService,
         device: Device,
 ) -> Result<DeviceRow, StatusCode> {
-        let flows = observation
-                .recent_flows(&device.mac_address)
+        let flow_summary = observation
+                .recent_flow_summary(&device.mac_address)
                 .map_err(service_error)?;
         let domains = observation
                 .device_domain_top(&device.mac_address)
                 .map_err(service_error)?;
-        let upload_bytes = flows
-                .iter()
-                .map(|flow| flow.upload_bytes)
-                .fold(0_u64, u64::saturating_add);
-        let download_bytes = flows
-                .iter()
-                .map(|flow| flow.download_bytes)
-                .fold(0_u64, u64::saturating_add);
-        let last_seen = flows.iter().map(|flow| flow.last_seen).max();
+        let upload_bytes = flow_summary.upload_bytes;
+        let download_bytes = flow_summary.download_bytes;
         let (top_domain, top_domain_meta) = domains
                 .first()
                 .map(|domain| {
@@ -559,8 +648,9 @@ fn build_device_row(
                 upload_bytes: format_bytes(upload_bytes),
                 download_bytes: format_bytes(download_bytes),
                 total_bytes: format_bytes(upload_bytes.saturating_add(download_bytes)),
-                flow_count: flows.len(),
-                last_seen: last_seen
+                flow_count: flow_summary.flow_count,
+                last_seen: flow_summary
+                        .last_seen
                         .map(format_timestamp)
                         .unwrap_or_else(|| "暂无".to_owned()),
                 top_domain,
@@ -701,6 +791,27 @@ fn domain_trend_href(mac_address: &str, domain: &str, window: DomainTrendWindow)
         )
 }
 
+fn flow_detail_href(
+        mac_address: &str,
+        domain: Option<&str>,
+        domain_window: DomainTrendWindow,
+        flow_window: Option<&str>,
+        flow_cursor: Option<&str>,
+) -> String {
+        let mut query = Vec::new();
+        if let Some(domain) = domain {
+                query.push(format!("domain={}", percent_encode_component(domain)));
+                query.push(format!("domain_window={}", domain_window.query_value()));
+        }
+        if let Some(window) = flow_window {
+                query.push(format!("flow_window={window}"));
+        }
+        if let Some(cursor) = flow_cursor {
+                query.push(format!("flow_cursor={}", percent_encode_component(cursor)));
+        }
+        format!("/devices/{mac_address}?{}#flows", query.join("&"))
+}
+
 fn percent_encode_component(value: &str) -> String {
         let mut encoded = String::with_capacity(value.len());
         for byte in value.bytes() {
@@ -790,6 +901,15 @@ fn now_ms() -> i64 {
 fn service_error(error: rusqlite::Error) -> StatusCode {
         eprintln!("web data query failed: {error}");
         StatusCode::INTERNAL_SERVER_ERROR
+}
+
+fn flow_query_service_error(error: FlowQueryError) -> StatusCode {
+        if error.is_bad_request() {
+                StatusCode::BAD_REQUEST
+        } else {
+                eprintln!("web flow query failed: {error}");
+                StatusCode::INTERNAL_SERVER_ERROR
+        }
 }
 
 /// 返回内嵌的应用 CSS，并显式声明样式表 MIME 类型。
@@ -944,6 +1064,30 @@ mod tests {
                                 DomainTrendWindow::Days30,
                         ),
                         "/devices/aa:bb:cc:dd:ee:ff?domain=%E4%BE%8B%E5%AD%90.test%2Fa%2Bb&domain_window=30d"
+                );
+        }
+
+        #[test]
+        fn flow_href_preserves_domain_state_and_targets_flow_section() {
+                assert_eq!(
+                        flow_detail_href(
+                                "aa:bb:cc:dd:ee:ff",
+                                Some("shared & private.example"),
+                                DomainTrendWindow::Days30,
+                                Some("6h"),
+                                None,
+                        ),
+                        "/devices/aa:bb:cc:dd:ee:ff?domain=shared%20%26%20private.example&domain_window=30d&flow_window=6h#flows"
+                );
+                assert_eq!(
+                        flow_detail_href(
+                                "aa:bb:cc:dd:ee:ff",
+                                Some("example.com"),
+                                DomainTrendWindow::Hours24,
+                                None,
+                                Some("cursor_token"),
+                        ),
+                        "/devices/aa:bb:cc:dd:ee:ff?domain=example.com&domain_window=24h&flow_cursor=cursor_token#flows"
                 );
         }
 }

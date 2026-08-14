@@ -1,6 +1,6 @@
 use axum::{
         Json, Router,
-        extract::{Path, State},
+        extract::{Path, Query, State},
         http::{HeaderMap, StatusCode},
         middleware,
         response::IntoResponse,
@@ -10,9 +10,9 @@ use serde::Deserialize;
 
 use crate::auth;
 use crate::domain::{
-        Device, DeviceMinuteStat, DomainMinuteStat, DomainTrafficSummary, Flow,
-        normalize_display_name,
+        Device, DeviceMinuteStat, DomainMinuteStat, DomainTrafficSummary, normalize_display_name,
 };
+use crate::service::{FlowPage, FlowQueryError};
 use crate::state::AppState;
 
 /// 注册公开 API 路由（健康检查）。
@@ -116,15 +116,34 @@ async fn device_traffic(
 async fn device_flows(
         State(state): State<AppState>,
         Path(mac_address): Path<String>,
-) -> Result<Json<Vec<Flow>>, StatusCode> {
+        Query(query): Query<FlowPageQuery>,
+) -> Result<Json<FlowPage>, StatusCode> {
         require_device(&state, &mac_address)?;
         state.observation
-                .recent_flows(&mac_address)
+                .flow_page(
+                        &mac_address,
+                        query.window.as_deref(),
+                        query.limit,
+                        query.cursor.as_deref(),
+                )
                 .map(Json)
-                .map_err(|err| {
-                        eprintln!("device_flows failed: {err}");
-                        StatusCode::INTERNAL_SERVER_ERROR
-                })
+                .map_err(flow_query_error)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FlowPageQuery {
+        window: Option<String>,
+        limit: Option<usize>,
+        cursor: Option<String>,
+}
+
+fn flow_query_error(error: FlowQueryError) -> StatusCode {
+        if error.is_bad_request() {
+                StatusCode::BAD_REQUEST
+        } else {
+                eprintln!("device_flows failed: {error}");
+                StatusCode::INTERNAL_SERVER_ERROR
+        }
 }
 
 /// 返回某设备的域名流量 Top。

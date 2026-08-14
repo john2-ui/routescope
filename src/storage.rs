@@ -1,14 +1,32 @@
 //! SQLite persistence: schema, repository, and retention cleanup.
 
 use crate::domain::{
-        ConnectionState, Device, DeviceMinuteStat, DomainAttribution, DomainConfidence,
-        DomainMinuteStat, DomainSource, DomainTrafficSummary, Flow, FlowCounters, FlowDirection,
-        floor_to_minute_ms,
+        ConnectionState, Device, DeviceFlowSummary, DeviceMinuteStat, DomainAttribution,
+        DomainConfidence, DomainMinuteStat, DomainSource, DomainTrafficSummary, Flow, FlowCounters,
+        FlowDirection, FlowPageAnchor, FlowPageDirection, floor_to_minute_ms,
 };
-use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, Transaction, params};
+use rusqlite::{
+        Connection, OptionalExtension, Params, Result as SqliteResult, Row, Statement, Transaction,
+        params,
+};
 use std::{io, sync::Mutex, time::Duration};
 
-const CURRENT_SCHEMA_VERSION: i32 = 1;
+const CURRENT_SCHEMA_VERSION: i32 = 2;
+
+const FLOW_SELECT: &str = r#"
+        SELECT
+            flow_id, first_seen, last_seen, protocol, direction,
+            lan_interface, wan_interface,
+            client_mac, client_ip, client_port,
+            destination_ip, destination_port,
+            nat_source_ip, nat_source_port,
+            nat_destination_ip, nat_destination_port,
+            upload_bytes, download_bytes, packet_count,
+            domain, domain_source, domain_confidence,
+            domain_associated_at, domain_expires_at,
+            connection_state
+        FROM flows
+"#;
 
 /// RouteScope 持久化仓储接口。
 pub trait RouteScopeRepository: Send + Sync {
@@ -30,8 +48,21 @@ pub trait RouteScopeRepository: Send + Sync {
                 mac_address: &str,
                 display_name: Option<&str>,
         ) -> SqliteResult<bool>;
-        /// 查询某设备全部 flow（按 last_seen 降序）。
-        fn list_recent_flows(&self, mac_address: &str) -> SqliteResult<Vec<Flow>>;
+        /// 按时间窗和稳定 keyset 边界查询某设备 Flow。
+        fn list_flow_page(
+                &self,
+                mac_address: &str,
+                since_ms: i64,
+                anchor: Option<&FlowPageAnchor>,
+                direction: FlowPageDirection,
+                limit: usize,
+        ) -> SqliteResult<Vec<Flow>>;
+        /// 聚合某设备时间窗内的 Flow，用于概览而不读取明细。
+        fn summarize_recent_flows(
+                &self,
+                mac_address: &str,
+                since_ms: i64,
+        ) -> SqliteResult<DeviceFlowSummary>;
         /// 查询某设备自 `since_ms` 起的分钟流量序列。
         fn list_device_minute_stats(
                 &self,
@@ -168,6 +199,15 @@ impl SqliteRepository {
             "#,
                         )?;
                 }
+                if version < 2 {
+                        tx.execute_batch(
+                                r#"
+            DROP INDEX IF EXISTS idx_flows_client_mac_last_seen;
+            CREATE INDEX IF NOT EXISTS idx_flows_client_mac_last_seen_flow_id
+                ON flows(client_mac, last_seen DESC, flow_id DESC);
+            "#,
+                        )?;
+                }
                 // Keep schema changes and user_version in the same transaction so a
                 // failed migration cannot leave the database marked as upgraded.
                 tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
@@ -218,6 +258,56 @@ fn configure_connection(conn: &Connection, enable_wal: bool) -> SqliteResult<()>
                 conn.pragma_update(None, "synchronous", "NORMAL")?;
         }
         Ok(())
+}
+
+fn collect_flow_rows<P: Params>(stmt: &mut Statement<'_>, params: P) -> SqliteResult<Vec<Flow>> {
+        stmt.query_map(params, flow_from_row)?.collect()
+}
+
+fn flow_from_row(row: &Row<'_>) -> SqliteResult<Flow> {
+        let direction_raw: String = row.get(4)?;
+        let state_raw: String = row.get(24)?;
+        let domain: Option<String> = row.get(19)?;
+        let domain = match domain {
+                Some(name) => {
+                        let source_raw: String = row.get(20)?;
+                        let confidence_raw: String = row.get(21)?;
+                        Some(DomainAttribution {
+                                domain: name,
+                                source: DomainSource::parse(&source_raw)
+                                        .unwrap_or(DomainSource::Unknown),
+                                confidence: DomainConfidence::parse(&confidence_raw)
+                                        .unwrap_or(DomainConfidence::Unknown),
+                                associated_at: row.get(22)?,
+                                expires_at: row.get(23)?,
+                        })
+                }
+                None => None,
+        };
+        Ok(Flow {
+                flow_id: row.get(0)?,
+                first_seen: row.get(1)?,
+                last_seen: row.get(2)?,
+                protocol: row.get(3)?,
+                direction: FlowDirection::parse(&direction_raw).unwrap_or(FlowDirection::Upload),
+                lan_interface: row.get(5)?,
+                wan_interface: row.get(6)?,
+                client_mac: row.get(7)?,
+                client_ip: row.get(8)?,
+                client_port: row.get::<_, i64>(9)? as u16,
+                destination_ip: row.get(10)?,
+                destination_port: row.get::<_, i64>(11)? as u16,
+                nat_source_ip: row.get(12)?,
+                nat_source_port: row.get::<_, Option<i64>>(13)?.map(|value| value as u16),
+                nat_destination_ip: row.get(14)?,
+                nat_destination_port: row.get::<_, Option<i64>>(15)?.map(|value| value as u16),
+                upload_bytes: row.get::<_, i64>(16)? as u64,
+                download_bytes: row.get::<_, i64>(17)? as u64,
+                packet_count: row.get::<_, i64>(18)? as u64,
+                domain,
+                connection_state: ConnectionState::parse(&state_raw)
+                        .unwrap_or(ConnectionState::Unknown),
+        })
 }
 
 fn unsupported_schema_error(version: i32) -> rusqlite::Error {
@@ -591,78 +681,92 @@ impl RouteScopeRepository for SqliteRepository {
                 Ok(updated == 1)
         }
 
-        /// 查询某设备全部 flow（含域名归因），按 last_seen 降序。
-        fn list_recent_flows(&self, mac_address: &str) -> SqliteResult<Vec<Flow>> {
+        /// 按时间窗与 `(last_seen, flow_id)` keyset 查询某设备 Flow。
+        fn list_flow_page(
+                &self,
+                mac_address: &str,
+                since_ms: i64,
+                anchor: Option<&FlowPageAnchor>,
+                direction: FlowPageDirection,
+                limit: usize,
+        ) -> SqliteResult<Vec<Flow>> {
                 let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-                let mut stmt = conn.prepare(
+                let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+
+                match (anchor, direction) {
+                        (None, _) => {
+                                let sql = format!(
+                                        "{FLOW_SELECT} WHERE client_mac = ?1 AND last_seen >= ?2 \
+                                         ORDER BY last_seen DESC, flow_id DESC LIMIT ?3"
+                                );
+                                let mut stmt = conn.prepare(&sql)?;
+                                collect_flow_rows(&mut stmt, params![mac_address, since_ms, limit])
+                        }
+                        (Some(anchor), FlowPageDirection::Older) => {
+                                let sql = format!(
+                                        "{FLOW_SELECT} WHERE client_mac = ?1 AND last_seen >= ?2 \
+                                         AND (last_seen < ?3 OR (last_seen = ?3 AND flow_id < ?4)) \
+                                         ORDER BY last_seen DESC, flow_id DESC LIMIT ?5"
+                                );
+                                let mut stmt = conn.prepare(&sql)?;
+                                collect_flow_rows(
+                                        &mut stmt,
+                                        params![
+                                                mac_address,
+                                                since_ms,
+                                                anchor.last_seen,
+                                                anchor.flow_id,
+                                                limit
+                                        ],
+                                )
+                        }
+                        (Some(anchor), FlowPageDirection::Newer) => {
+                                let sql = format!(
+                                        "{FLOW_SELECT} WHERE client_mac = ?1 AND last_seen >= ?2 \
+                                         AND (last_seen > ?3 OR (last_seen = ?3 AND flow_id > ?4)) \
+                                         ORDER BY last_seen ASC, flow_id ASC LIMIT ?5"
+                                );
+                                let mut stmt = conn.prepare(&sql)?;
+                                collect_flow_rows(
+                                        &mut stmt,
+                                        params![
+                                                mac_address,
+                                                since_ms,
+                                                anchor.last_seen,
+                                                anchor.flow_id,
+                                                limit
+                                        ],
+                                )
+                        }
+                }
+        }
+
+        fn summarize_recent_flows(
+                &self,
+                mac_address: &str,
+                since_ms: i64,
+        ) -> SqliteResult<DeviceFlowSummary> {
+                let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+                conn.query_row(
                         r#"
                 SELECT
-                    flow_id, first_seen, last_seen, protocol, direction,
-                    lan_interface, wan_interface,
-                    client_mac, client_ip, client_port,
-                    destination_ip, destination_port,
-                    nat_source_ip, nat_source_port,
-                    nat_destination_ip, nat_destination_port,
-                    upload_bytes, download_bytes, packet_count,
-                    domain, domain_source, domain_confidence,
-                    domain_associated_at, domain_expires_at,
-                    connection_state
+                    COALESCE(SUM(upload_bytes), 0),
+                    COALESCE(SUM(download_bytes), 0),
+                    COUNT(*),
+                    MAX(last_seen)
                 FROM flows
-                WHERE client_mac = ?1
-                ORDER BY last_seen DESC
+                WHERE client_mac = ?1 AND last_seen >= ?2
                 "#,
-                )?;
-                let rows = stmt.query_map(params![mac_address], |row| {
-                        let direction_raw: String = row.get(4)?;
-                        let state_raw: String = row.get(24)?;
-                        let domain: Option<String> = row.get(19)?;
-                        let domain = match domain {
-                                Some(name) => {
-                                        let source_raw: String = row.get(20)?;
-                                        let confidence_raw: String = row.get(21)?;
-                                        Some(DomainAttribution {
-                                                domain: name,
-                                                source: DomainSource::parse(&source_raw)
-                                                        .unwrap_or(DomainSource::Unknown),
-                                                confidence: DomainConfidence::parse(
-                                                        &confidence_raw,
-                                                )
-                                                .unwrap_or(DomainConfidence::Unknown),
-                                                associated_at: row.get(22)?,
-                                                expires_at: row.get(23)?,
-                                        })
-                                }
-                                None => None,
-                        };
-                        Ok(Flow {
-                                flow_id: row.get(0)?,
-                                first_seen: row.get(1)?,
-                                last_seen: row.get(2)?,
-                                protocol: row.get(3)?,
-                                direction: FlowDirection::parse(&direction_raw)
-                                        .unwrap_or(FlowDirection::Upload),
-                                lan_interface: row.get(5)?,
-                                wan_interface: row.get(6)?,
-                                client_mac: row.get(7)?,
-                                client_ip: row.get(8)?,
-                                client_port: row.get::<_, i64>(9)? as u16,
-                                destination_ip: row.get(10)?,
-                                destination_port: row.get::<_, i64>(11)? as u16,
-                                nat_source_ip: row.get(12)?,
-                                nat_source_port: row.get::<_, Option<i64>>(13)?.map(|v| v as u16),
-                                nat_destination_ip: row.get(14)?,
-                                nat_destination_port: row
-                                        .get::<_, Option<i64>>(15)?
-                                        .map(|v| v as u16),
-                                upload_bytes: row.get::<_, i64>(16)? as u64,
-                                download_bytes: row.get::<_, i64>(17)? as u64,
-                                packet_count: row.get::<_, i64>(18)? as u64,
-                                domain,
-                                connection_state: ConnectionState::parse(&state_raw)
-                                        .unwrap_or(ConnectionState::Unknown),
-                        })
-                })?;
-                rows.collect()
+                        params![mac_address, since_ms],
+                        |row| {
+                                Ok(DeviceFlowSummary {
+                                        upload_bytes: row.get::<_, i64>(0)? as u64,
+                                        download_bytes: row.get::<_, i64>(1)? as u64,
+                                        flow_count: row.get::<_, i64>(2)? as usize,
+                                        last_seen: row.get(3)?,
+                                })
+                        },
+                )
         }
 
         /// 查询某设备自 `since_ms` 起的分钟流量序列。
@@ -858,6 +962,11 @@ mod tests {
                 }
         }
 
+        fn all_flows(repo: &SqliteRepository, mac: &str) -> Vec<Flow> {
+                repo.list_flow_page(mac, i64::MIN, None, FlowPageDirection::Older, usize::MAX)
+                        .unwrap()
+        }
+
         #[test]
         fn upsert_and_find_device_by_mac() {
                 let repo = SqliteRepository::open_in_memory().unwrap();
@@ -883,6 +992,145 @@ mod tests {
                                 .unwrap()
                 };
                 assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        }
+
+        #[test]
+        fn version_one_database_migrates_to_composite_flow_index() {
+                let conn = Connection::open_in_memory().unwrap();
+                configure_connection(&conn, false).unwrap();
+                conn.execute_batch(
+                        r#"
+                CREATE TABLE flows (
+                    flow_id TEXT PRIMARY KEY NOT NULL,
+                    client_mac TEXT NOT NULL,
+                    last_seen INTEGER NOT NULL
+                );
+                CREATE INDEX idx_flows_client_mac_last_seen
+                    ON flows(client_mac, last_seen DESC);
+                PRAGMA user_version = 1;
+                "#,
+                )
+                .unwrap();
+                let repo = SqliteRepository {
+                        conn: Mutex::new(conn),
+                };
+
+                repo.migrate().unwrap();
+
+                let conn = repo.conn.lock().unwrap();
+                let version: i32 = conn
+                        .pragma_query_value(None, "user_version", |row| row.get(0))
+                        .unwrap();
+                assert_eq!(version, 2);
+                let old_exists = conn
+                        .prepare(
+                                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = \
+                                 'idx_flows_client_mac_last_seen'",
+                        )
+                        .unwrap()
+                        .exists([])
+                        .unwrap();
+                let new_sql: String = conn
+                        .query_row(
+                                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = \
+                                 'idx_flows_client_mac_last_seen_flow_id'",
+                                [],
+                                |row| row.get(0),
+                        )
+                        .unwrap();
+                assert!(!old_exists);
+                assert!(new_sql.contains("client_mac, last_seen DESC, flow_id DESC"));
+        }
+
+        #[test]
+        fn flow_pages_use_stable_time_and_id_boundaries() {
+                let repo = SqliteRepository::open_in_memory().unwrap();
+                let mac = "aa:bb:cc:dd:ee:ff";
+                for (id, last_seen) in [
+                        ("same-a", 100_000),
+                        ("same-c", 100_000),
+                        ("same-b", 100_000),
+                        ("older-b", 90_000),
+                        ("older-a", 90_000),
+                        ("expired", 70_000),
+                ] {
+                        repo.upsert_flow(&sample_flow(id, mac, last_seen)).unwrap();
+                }
+                repo.upsert_flow(&sample_flow("other-device", "00:00:00:00:00:01", 110_000))
+                        .unwrap();
+
+                let first = repo
+                        .list_flow_page(mac, 80_000, None, FlowPageDirection::Older, 2)
+                        .unwrap();
+                assert_eq!(
+                        first.iter()
+                                .map(|flow| flow.flow_id.as_str())
+                                .collect::<Vec<_>>(),
+                        ["same-c", "same-b"]
+                );
+
+                let older = repo
+                        .list_flow_page(
+                                mac,
+                                80_000,
+                                Some(&FlowPageAnchor {
+                                        last_seen: first[1].last_seen,
+                                        flow_id: first[1].flow_id.clone(),
+                                }),
+                                FlowPageDirection::Older,
+                                3,
+                        )
+                        .unwrap();
+                assert_eq!(
+                        older.iter()
+                                .map(|flow| flow.flow_id.as_str())
+                                .collect::<Vec<_>>(),
+                        ["same-a", "older-b", "older-a"]
+                );
+
+                let newer = repo
+                        .list_flow_page(
+                                mac,
+                                80_000,
+                                Some(&FlowPageAnchor {
+                                        last_seen: older[0].last_seen,
+                                        flow_id: older[0].flow_id.clone(),
+                                }),
+                                FlowPageDirection::Newer,
+                                2,
+                        )
+                        .unwrap();
+                assert_eq!(
+                        newer.iter()
+                                .map(|flow| flow.flow_id.as_str())
+                                .collect::<Vec<_>>(),
+                        ["same-b", "same-c"]
+                );
+        }
+
+        #[test]
+        fn recent_flow_summary_is_computed_in_sql_with_cutoff() {
+                let repo = SqliteRepository::open_in_memory().unwrap();
+                let mac = "aa:bb:cc:dd:ee:ff";
+                let mut first = sample_flow("summary-first", mac, 100_000);
+                first.upload_bytes = 10;
+                first.download_bytes = 20;
+                let mut second = sample_flow("summary-second", mac, 110_000);
+                second.upload_bytes = 30;
+                second.download_bytes = 40;
+                repo.upsert_flows(&[first, second]).unwrap();
+                repo.upsert_flow(&sample_flow("summary-old", mac, 80_000))
+                        .unwrap();
+
+                assert_eq!(
+                        repo.summarize_recent_flows(mac, 90_000).unwrap(),
+                        DeviceFlowSummary {
+                                upload_bytes: 40,
+                                download_bytes: 60,
+                                flow_count: 2,
+                                last_seen: Some(110_000),
+                        }
+                );
         }
 
         #[test]
@@ -1013,7 +1261,7 @@ mod tests {
                 let flow = sample_flow("flow-1", "aa:bb:cc:dd:ee:ff", 10_000);
 
                 repo.upsert_flow(&flow).unwrap();
-                let loaded = repo.list_recent_flows("aa:bb:cc:dd:ee:ff").unwrap();
+                let loaded = all_flows(&repo, "aa:bb:cc:dd:ee:ff");
 
                 assert_eq!(loaded.len(), 1);
                 assert_eq!(loaded[0], flow);
@@ -1033,7 +1281,7 @@ mod tests {
                 let (deleted_flows, _) = repo.delete_expired_data(now, 24, 30).unwrap();
                 assert_eq!(deleted_flows, 1);
 
-                let remaining = repo.list_recent_flows(mac).unwrap();
+                let remaining = all_flows(&repo, mac);
                 assert_eq!(remaining.len(), 1);
                 assert_eq!(remaining[0].flow_id, "new");
         }
@@ -1186,7 +1434,7 @@ mod tests {
                 flow.nat_destination_port = Some(443);
                 repo.upsert_flow(&flow).unwrap();
 
-                let loaded = repo.list_recent_flows(mac).unwrap();
+                let loaded = all_flows(&repo, mac);
                 assert_eq!(loaded.len(), 1);
                 assert_eq!(loaded[0].nat_source_port, Some(40_001));
                 assert_eq!(loaded[0].nat_destination_port, Some(443));
@@ -1210,7 +1458,7 @@ mod tests {
 
                 assert!(repo.upsert_flow(&flow).is_err());
 
-                let stored = repo.list_recent_flows(mac).unwrap();
+                let stored = all_flows(&repo, mac);
                 assert_eq!(stored.len(), 1);
                 assert_eq!(stored[0].upload_bytes, 1_000);
                 assert_eq!(stored[0].download_bytes, 2_000);

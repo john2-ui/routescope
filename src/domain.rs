@@ -58,6 +58,28 @@ pub struct Flow {
         pub connection_state: ConnectionState,
 }
 
+/// Stable keyset boundary for descending Flow pagination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowPageAnchor {
+        pub last_seen: TimestampMs,
+        pub flow_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowPageDirection {
+        Older,
+        Newer,
+}
+
+/// Aggregate used by overview pages without loading every retained Flow row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceFlowSummary {
+        pub upload_bytes: u64,
+        pub download_bytes: u64,
+        pub flow_count: usize,
+        pub last_seen: Option<TimestampMs>,
+}
+
 impl Flow {
         /// 校验 flow 必填字段与时间顺序是否合法。
         pub fn validate(&self) -> Result<(), &'static str> {

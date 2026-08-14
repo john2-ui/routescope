@@ -100,8 +100,21 @@
     </section>
     {% endif %}
 
-    <section class="terminal-window">
-      <div class="terminal-title"><span>[ flows / last 24h ]</span><span>LAN client perspective</span></div>
+    <section class="terminal-window" id="flows">
+      <div class="terminal-title">
+        <span>[ flows / {{ flow_window_label }} ]</span>
+        <span class="window-tabs">
+          {% if flow_1h_active %}<span class="active">[1H]</span>{% else %}<a href="{{ flow_1h_href }}">[1H]</a>{% endif %}
+          {% if flow_6h_active %}<span class="active">[6H]</span>{% else %}<a href="{{ flow_6h_href }}">[6H]</a>{% endif %}
+          {% if flow_24h_active %}<span class="active">[24H]</span>{% else %}<a href="{{ flow_24h_href }}">[24H]</a>{% endif %}
+        </span>
+      </div>
+      <div class="flow-pager" aria-label="Flow pagination">
+        {% if flow_first_active %}<span class="active">[FIRST]</span>{% else %}<a href="{{ flow_first_href }}">[FIRST]</a>{% endif %}
+        {% if flow_has_newer %}<a href="{{ flow_newer_href }}">[NEWER]</a>{% else %}<span class="disabled">[NEWER]</span>{% endif %}
+        {% if flow_has_older %}<a href="{{ flow_older_href }}">[OLDER]</a>{% else %}<span class="disabled">[OLDER]</span>{% endif %}
+        <span>{{ flows.len() }} rows / LAN client perspective</span>
+      </div>
       {% if flows.is_empty() %}
       <p class="empty-inline">-- no flow records --</p>
       {% else %}
