@@ -3,70 +3,68 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>设备详情 · RouteScope</title>
+  <title>{{ device.display_name }} · RouteScope</title>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <header class="header">
+  <header class="terminal-header">
     <a class="brand" href="/">RouteScope</a>
-    <nav>
-      <a href="/">概览</a><a href="/devices">设备</a>
-      <form method="post" action="/logout" class="logout-form">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit">退出</button>
-      </form>
-    </nav>
+    <span class="header-context">device/{{ device.mac_address }}</span>
+    <span class="header-spacer"></span>
+    <span class="status status-{{ collector_status }}">[collector: {{ collector_status }}]</span>
+    <nav aria-label="主导航"><a href="/">F1 Overview</a><a class="active" href="/devices">F2 Devices</a></nav>
+    <form method="post" action="/logout" class="logout-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit">F10 Quit</button>
+    </form>
   </header>
-  <main>
-    <p class="eyebrow">设备详情</p>
-    <p><a href="/devices">← 返回设备列表</a></p>
-    <div class="detail-heading">
-      <div>
-        <h1>{{ device.display_name }}</h1>
-        <p class="muted">{{ device.mac_address }} · {{ device.current_ip }}</p>
+  <main class="terminal-main">
+    <section class="terminal-window">
+      <div class="terminal-title"><span>[ device: {{ device.display_name }} ]</span><a href="/devices">← device list</a></div>
+      <div class="device-ident"><span>MAC {{ device.mac_address }}</span><span>IP {{ device.current_ip }}</span><span class="status status-{{ collector_status }}">STATE {{ collector_status }}</span></div>
+      <div class="meter-grid">
+        <div class="meter meter-value"><span>Flows</span><strong>{{ device.flow_count }}</strong></div>
+        <div class="meter"><span>Total</span><strong>{{ device.total_bytes }}</strong><i style="--meter: {{ device_total_meter }}%"></i></div>
+        <div class="meter"><span>Upload</span><strong class="traffic-up">{{ device.upload_bytes }}</strong><i class="meter-up" style="--meter: {{ device_upload_meter }}%"></i></div>
+        <div class="meter"><span>Download</span><strong class="traffic-down">{{ device.download_bytes }}</strong><i class="meter-down" style="--meter: {{ device_download_meter }}%"></i></div>
       </div>
-      <span class="badge badge-{{ collector_status }}">采集器 {{ collector_status }}</span>
-    </div>
-    <section class="metric-grid">
-      <article class="metric-card"><span>最近连接</span><strong>{{ device.flow_count }}</strong></article>
-      <article class="metric-card"><span>总流量</span><strong>{{ device.total_bytes }}</strong></article>
-      <article class="metric-card"><span>上行</span><strong>{{ device.upload_bytes }}</strong></article>
-      <article class="metric-card"><span>下行</span><strong>{{ device.download_bytes }}</strong></article>
     </section>
-    <section class="panel">
-      <div class="section-heading"><h2>最近 24 小时分钟趋势</h2><span class="muted">最多显示最近 180 个桶</span></div>
+
+    <section class="terminal-window">
+      <div class="terminal-title"><span>[ device traffic / 24h ]</span><span>latest 180 minute buckets</span></div>
       {% if traffic.is_empty() %}
-      <p class="empty-inline">暂无分钟聚合数据。</p>
+      <p class="empty-inline">-- no minute aggregates --</p>
       {% else %}
       <div class="traffic-chart">
       {% for point in traffic %}
         <div class="traffic-row">
           <time>{{ point.minute }}</time>
-          <div class="bar-track"><div class="bar-fill" style="width: {{ point.bar_width }}%"></div></div>
+          <div class="bar-track" aria-label="{{ point.total_bytes }}"><div class="bar-fill" style="width: {{ point.bar_width }}%"></div></div>
           <span>{{ point.total_bytes }}</span>
-          <small><span class="traffic-up">{{ point.upload_bytes }}</span> / <span class="traffic-down">{{ point.download_bytes }}</span></small>
+          <small><span class="traffic-up">↑{{ point.upload_bytes }}</span> <span class="traffic-down">↓{{ point.download_bytes }}</span></small>
         </div>
       {% endfor %}
       </div>
       {% endif %}
     </section>
-    <section class="panel">
-      <div class="section-heading"><h2>域名 Top</h2><span class="muted">来源 / 置信度</span></div>
+
+    <section class="terminal-window">
+      <div class="terminal-title"><span>[ domain top ]</span><span>select a domain to inspect trend</span></div>
       {% if domains.is_empty() %}
-      <p class="empty-inline">没有可靠的域名归因；未知连接不会被猜测成域名。</p>
+      <p class="empty-inline">-- no reliable attribution; unknown flows remain unknown --</p>
       {% else %}
       <div class="table-wrap">
-        <table>
-          <thead><tr><th>域名</th><th>总流量</th><th>上行</th><th>下行</th><th>来源</th><th>置信度</th></tr></thead>
+        <table class="terminal-table domain-table">
+          <thead><tr><th>DOMAIN</th><th>TOTAL</th><th>UPLOAD</th><th>DOWNLOAD</th><th>SOURCE</th><th>CONFIDENCE</th></tr></thead>
           <tbody>
           {% for domain in domains %}
             <tr>
-              <td><strong>{{ domain.domain }}</strong></td>
+              <td>{% if domain.selected %}<span class="selection">›</span>{% endif %}<a href="{{ domain.trend_href }}">{{ domain.domain }}</a></td>
               <td>{{ domain.total_bytes }}</td>
-              <td>{{ domain.upload_bytes }}</td>
-              <td>{{ domain.download_bytes }}</td>
-              <td>{{ domain.source }}</td>
-              <td><span class="badge badge-{{ domain.confidence }}">{{ domain.confidence }}</span></td>
+              <td class="traffic-up">↑ {{ domain.upload_bytes }}</td>
+              <td class="traffic-down">↓ {{ domain.download_bytes }}</td>
+              <td>[{{ domain.source }}]</td>
+              <td><span class="status status-{{ domain.confidence }}">[{{ domain.confidence }}]</span></td>
             </tr>
           {% endfor %}
           </tbody>
@@ -74,23 +72,51 @@
       </div>
       {% endif %}
     </section>
-    <section class="panel">
-      <div class="section-heading"><h2>最近 24 小时 Flow</h2><span class="muted">客户端视角：上行 / 下行</span></div>
+
+    {% if show_domain_trend %}
+    <section class="terminal-window" id="domain-trend">
+      <div class="terminal-title">
+        <span>[ domain trend: {{ selected_domain }} ]</span>
+        <span class="window-tabs">
+          {% if domain_24h_active %}<span class="active">[24H]</span>{% else %}<a href="{{ domain_24h_href }}#domain-trend">[24H]</a>{% endif %}
+          {% if domain_30d_active %}<span class="active">[30D]</span>{% else %}<a href="{{ domain_30d_href }}#domain-trend">[30D]</a>{% endif %}
+        </span>
+      </div>
+      <p class="chart-meta">{{ domain_window_label }} · API retains raw minute resolution</p>
+      {% if domain_traffic.is_empty() %}
+      <p class="empty-inline">-- no domain traffic in selected window --</p>
+      {% else %}
+      <div class="traffic-chart domain-chart">
+      {% for point in domain_traffic %}
+        <div class="traffic-row">
+          <time>{{ point.minute }}</time>
+          <div class="bar-track" aria-label="{{ point.total_bytes }}"><div class="bar-fill domain-bar" style="width: {{ point.bar_width }}%"></div></div>
+          <span>{{ point.total_bytes }}</span>
+          <small><span class="traffic-up">↑{{ point.upload_bytes }}</span> <span class="traffic-down">↓{{ point.download_bytes }}</span></small>
+        </div>
+      {% endfor %}
+      </div>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    <section class="terminal-window">
+      <div class="terminal-title"><span>[ flows / last 24h ]</span><span>LAN client perspective</span></div>
       {% if flows.is_empty() %}
-      <p class="empty-inline">暂无连接数据。</p>
+      <p class="empty-inline">-- no flow records --</p>
       {% else %}
       <div class="table-wrap">
-        <table>
-          <thead><tr><th>最近观测</th><th>协议 / 状态</th><th>客户端</th><th>目标</th><th>NAT 映射</th><th>流量</th><th>域名</th></tr></thead>
+        <table class="terminal-table flow-table">
+          <thead><tr><th>LAST SEEN</th><th>PROTO / STATE</th><th>CLIENT</th><th>DESTINATION</th><th>NAT MAPPING</th><th>TRAFFIC</th><th>DOMAIN</th></tr></thead>
           <tbody>
           {% for flow in flows %}
             <tr>
               <td>{{ flow.last_seen }}</td>
-              <td>{{ flow.protocol }}<small>{{ flow.connection_state }}</small></td>
+              <td>{{ flow.protocol }}<small>[{{ flow.connection_state }}]</small></td>
               <td>{{ flow.client_endpoint }}</td>
               <td>{{ flow.destination_endpoint }}</td>
               <td><small>{{ flow.nat_mapping }}</small></td>
-              <td><span class="traffic-up">{{ flow.upload_bytes }}</span><br><span class="traffic-down">{{ flow.download_bytes }}</span><small>{{ flow.packet_count }} packets</small></td>
+              <td><span class="traffic-up">↑ {{ flow.upload_bytes }}</span><small class="traffic-down">↓ {{ flow.download_bytes }}</small><small>{{ flow.packet_count }} packets</small></td>
               <td>{{ flow.domain }}<small>{{ flow.source }} / {{ flow.confidence }}</small></td>
             </tr>
           {% endfor %}
@@ -100,5 +126,6 @@
       {% endif %}
     </section>
   </main>
+  <footer class="keybar"><a href="/">F1 Overview</a><a href="/devices">F2 Devices</a><span>F5 Refresh</span><span>Enter Select</span></footer>
 </body>
 </html>

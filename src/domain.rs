@@ -293,6 +293,18 @@ pub struct DeviceMinuteStat {
         pub download_bytes: u64,
 }
 
+/// Per-device, per-domain minute traffic bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DomainMinuteStat {
+        pub mac_address: String,
+        pub domain: String,
+        pub minute_ms: TimestampMs,
+        pub upload_bytes: u64,
+        pub download_bytes: u64,
+        pub source: DomainSource,
+        pub confidence: DomainConfidence,
+}
+
 /// Per-device domain traffic summary for Top rankings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DomainTrafficSummary {

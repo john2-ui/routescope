@@ -3,24 +3,36 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>登录 · RouteScope</title>
+  <title>login · RouteScope</title>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body class="auth-page">
-  <main class="auth-card">
-    <p class="eyebrow">RouteScope</p>
-    <h1>管理登录</h1>
-    {% if !error.is_empty() %}
-    <p class="error">{{ error }}</p>
-    {% else %}
-    <p>使用本地管理员账户登录管理面。</p>
-    {% endif %}
-    <form method="post" action="/login">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <label>用户名<input name="username" autocomplete="username" required></label>
-      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
-      <button type="submit">登录</button>
-    </form>
+  <header class="terminal-header">
+    <span class="brand">RouteScope</span>
+    <span class="header-context">local traffic monitor</span>
+    <span class="header-spacer"></span>
+    <span class="status status-{{ collector_status }}">[collector: {{ collector_status }}]</span>
+  </header>
+  <main class="auth-shell">
+    <section class="terminal-window auth-window" aria-labelledby="login-title">
+      <div class="terminal-title"><span>[ auth ]</span><span>localhost</span></div>
+      <div class="terminal-body">
+        <pre class="terminal-banner" aria-hidden="true">RouteScope :: Linux gateway observability</pre>
+        <h1 id="login-title">administrator login</h1>
+        {% if !error.is_empty() %}
+        <p class="error">[error] {{ error }}</p>
+        {% else %}
+        <p class="prompt-line"><span class="prompt">routescope@localhost:~$</span> authenticate --local</p>
+        {% endif %}
+        <form method="post" action="/login" class="terminal-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label><span>username:</span><input name="username" autocomplete="username" required autofocus></label>
+          <label><span>password:</span><input name="password" type="password" autocomplete="current-password" required></label>
+          <button type="submit">[ Login ]</button>
+        </form>
+      </div>
+      <div class="terminal-footer"><span>F1 Help</span><span>Enter Login</span><span>Esc Clear</span></div>
+    </section>
   </main>
 </body>
 </html>

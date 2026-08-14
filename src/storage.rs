@@ -2,7 +2,8 @@
 
 use crate::domain::{
         ConnectionState, Device, DeviceMinuteStat, DomainAttribution, DomainConfidence,
-        DomainSource, DomainTrafficSummary, Flow, FlowCounters, FlowDirection, floor_to_minute_ms,
+        DomainMinuteStat, DomainSource, DomainTrafficSummary, Flow, FlowCounters, FlowDirection,
+        floor_to_minute_ms,
 };
 use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, Transaction, params};
 use std::{io, sync::Mutex, time::Duration};
@@ -37,6 +38,13 @@ pub trait RouteScopeRepository: Send + Sync {
                 mac_address: &str,
                 since_ms: i64,
         ) -> SqliteResult<Vec<DeviceMinuteStat>>;
+        /// 查询某设备、某域名自 `since_ms` 起的分钟流量序列。
+        fn list_domain_minute_stats(
+                &self,
+                mac_address: &str,
+                domain: &str,
+                since_ms: i64,
+        ) -> SqliteResult<Vec<DomainMinuteStat>>;
         /// 聚合某设备域名流量 Top N。
         fn list_domain_traffic_top(
                 &self,
@@ -683,6 +691,41 @@ impl RouteScopeRepository for SqliteRepository {
                 rows.collect()
         }
 
+        /// 查询某设备、某域名的分钟流量，按时间升序返回。
+        fn list_domain_minute_stats(
+                &self,
+                mac_address: &str,
+                domain: &str,
+                since_ms: i64,
+        ) -> SqliteResult<Vec<DomainMinuteStat>> {
+                let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+                let mut stmt = conn.prepare(
+                        r#"
+            SELECT mac_address, domain, minute_ms, upload_bytes, download_bytes,
+                   domain_source, confidence
+            FROM domain_minute_stats
+            WHERE mac_address = ?1 AND domain = ?2 AND minute_ms >= ?3
+            ORDER BY minute_ms ASC
+            "#,
+                )?;
+                let rows = stmt.query_map(params![mac_address, domain, since_ms], |row| {
+                        let source_raw: String = row.get(5)?;
+                        let confidence_raw: String = row.get(6)?;
+                        Ok(DomainMinuteStat {
+                                mac_address: row.get(0)?,
+                                domain: row.get(1)?,
+                                minute_ms: row.get(2)?,
+                                upload_bytes: row.get::<_, i64>(3)? as u64,
+                                download_bytes: row.get::<_, i64>(4)? as u64,
+                                source: DomainSource::parse(&source_raw)
+                                        .unwrap_or(DomainSource::Unknown),
+                                confidence: DomainConfidence::parse(&confidence_raw)
+                                        .unwrap_or(DomainConfidence::Unknown),
+                        })
+                })?;
+                rows.collect()
+        }
+
         /// 聚合某设备域名流量 Top N（按总字节排序，附带置信度与来源）。
         fn list_domain_traffic_top(
                 &self,
@@ -1062,6 +1105,49 @@ mod tests {
                 assert_eq!(domains[0].total_bytes, 4_000);
                 assert_eq!(domains[0].confidence, DomainConfidence::High);
                 assert_eq!(domains[0].source, DomainSource::Dns);
+        }
+
+        #[test]
+        fn domain_minute_query_filters_domain_and_orders_by_minute() {
+                let repo = SqliteRepository::open_in_memory().unwrap();
+                let mac = "aa:bb:cc:dd:ee:ff";
+
+                let mut later = sample_flow("trend-later", mac, 185_000);
+                later.upload_bytes = 300;
+                later.download_bytes = 700;
+                repo.upsert_flow(&later).unwrap();
+
+                let mut other = sample_flow("trend-other", mac, 155_000);
+                other.domain = Some(DomainAttribution {
+                        domain: "other.example".to_owned(),
+                        source: DomainSource::Sni,
+                        confidence: DomainConfidence::Low,
+                        associated_at: 154_000,
+                        expires_at: Some(300_000),
+                });
+                repo.upsert_flow(&other).unwrap();
+
+                let mut earlier = sample_flow("trend-earlier", mac, 125_000);
+                earlier.upload_bytes = 100;
+                earlier.download_bytes = 200;
+                repo.upsert_flow(&earlier).unwrap();
+
+                let stats = repo
+                        .list_domain_minute_stats(mac, "example.com", 120_000)
+                        .unwrap();
+                assert_eq!(stats.len(), 2);
+                assert_eq!(stats[0].minute_ms, 120_000);
+                assert_eq!(stats[0].upload_bytes, 100);
+                assert_eq!(stats[0].download_bytes, 200);
+                assert_eq!(stats[1].minute_ms, 180_000);
+                assert_eq!(stats[1].upload_bytes, 300);
+                assert_eq!(stats[1].download_bytes, 700);
+                assert!(stats.iter().all(|stat| stat.mac_address == mac));
+                assert!(stats.iter().all(|stat| stat.domain == "example.com"));
+                assert!(stats.iter().all(|stat| stat.source == DomainSource::Dns));
+                assert!(stats
+                        .iter()
+                        .all(|stat| stat.confidence == DomainConfidence::High));
         }
 
         #[test]

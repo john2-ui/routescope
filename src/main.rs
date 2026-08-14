@@ -536,6 +536,22 @@ mod tests {
                         .unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
 
+                let stylesheet = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri("/static/app.css")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(stylesheet.status(), StatusCode::OK);
+                assert_eq!(
+                        stylesheet.headers().get(header::CONTENT_TYPE).unwrap(),
+                        "text/css; charset=utf-8"
+                );
+
                 let readiness = application
                         .oneshot(
                                 Request::builder()
@@ -754,6 +770,83 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn domain_traffic_api_returns_raw_minutes_and_handles_empty_and_missing_devices() {
+                let repo = Arc::new(SqliteRepository::open_in_memory().unwrap());
+                let observation = Arc::new(ObservationService::new(Arc::clone(&repo), 24, 30));
+                let batch = SimulatedCollector::new().collect().unwrap();
+                let mut first = batch.flows[0].clone();
+                let mut second = first.clone();
+                second.flow_id.push_str(":next-minute");
+                second.first_seen = second.first_seen.saturating_add(60_000);
+                second.last_seen = second.last_seen.saturating_add(60_000);
+                if let Some(domain) = second.domain.as_mut() {
+                        domain.associated_at = domain.associated_at.saturating_add(60_000);
+                        domain.expires_at = domain
+                                .expires_at
+                                .map(|expires_at| expires_at.saturating_add(60_000));
+                }
+                first.first_seen = first.first_seen.saturating_sub(60_000);
+                observation.ingest_flows(&[first, second]).unwrap();
+                let auth = Arc::new(
+                        AuthService::from_repository(Arc::clone(&repo), "admin".to_owned(), None)
+                                .unwrap(),
+                );
+                let application = app(AppState {
+                        observation,
+                        auth,
+                        collector_health: Arc::new(CollectorHealthTracker::new(None)),
+                        dev_bypass_auth: true,
+                        secure_cookies: false,
+                });
+
+                let response = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri("/api/v1/devices/aa:bb:cc:dd:ee:01/domains/example.com/traffic")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let stats: Vec<crate::domain::DomainMinuteStat> =
+                        serde_json::from_slice(&body).unwrap();
+                assert_eq!(stats.len(), 2);
+                assert!(stats[0].minute_ms < stats[1].minute_ms);
+                assert!(stats.iter().all(|stat| stat.domain == "example.com"));
+
+                let empty = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri("/api/v1/devices/aa:bb:cc:dd:ee:01/domains/missing.example/traffic")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(empty.status(), StatusCode::OK);
+                let empty_body = to_bytes(empty.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&empty_body).unwrap(),
+                        serde_json::json!([])
+                );
+
+                let missing_device = application
+                        .oneshot(
+                                Request::builder()
+                                        .uri("/api/v1/devices/00:00:00:00:00:00/domains/example.com/traffic")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(missing_device.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
         async fn web_pages_render_observed_data_and_name_form() {
                 let repo = Arc::new(SqliteRepository::open_in_memory().unwrap());
                 let observation = Arc::new(ObservationService::new(Arc::clone(&repo), 24, 30));
@@ -783,6 +876,7 @@ mod tests {
                 assert!(dashboard_html.contains("aa:bb:cc:dd:ee:01"));
 
                 let detail = application
+                        .clone()
                         .oneshot(
                                 Request::builder()
                                         .uri("/devices/aa:bb:cc:dd:ee:01")
@@ -794,7 +888,51 @@ mod tests {
                 assert_eq!(detail.status(), StatusCode::OK);
                 let detail_body = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
                 let detail_html = String::from_utf8(detail_body.to_vec()).unwrap();
-                assert!(detail_html.contains("最近 24 小时 Flow"));
+                assert!(detail_html.contains("flows / last 24h"));
                 assert!(detail_html.contains("example.com"));
+
+                let trend = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri("/devices/aa:bb:cc:dd:ee:01?domain=example.com&domain_window=30d")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(trend.status(), StatusCode::OK);
+                let trend_body = to_bytes(trend.into_body(), usize::MAX).await.unwrap();
+                let trend_html = String::from_utf8(trend_body.to_vec()).unwrap();
+                assert!(trend_html.contains("domain trend: example.com"));
+                assert!(trend_html.contains("30 天 / 6 小时桶"));
+                assert!(trend_html.contains("domain_window=24h"));
+
+                let empty_trend = application
+                        .clone()
+                        .oneshot(
+                                Request::builder()
+                                        .uri("/devices/aa:bb:cc:dd:ee:01?domain=missing.example&domain_window=24h")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(empty_trend.status(), StatusCode::OK);
+                let empty_trend_body = to_bytes(empty_trend.into_body(), usize::MAX).await.unwrap();
+                assert!(String::from_utf8(empty_trend_body.to_vec())
+                        .unwrap()
+                        .contains("-- no domain traffic in selected window --"));
+
+                let invalid_window = application
+                        .oneshot(
+                                Request::builder()
+                                        .uri("/devices/aa:bb:cc:dd:ee:01?domain=example.com&domain_window=year")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(invalid_window.status(), StatusCode::BAD_REQUEST);
         }
 }

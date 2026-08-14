@@ -1,7 +1,7 @@
 use askama::Template;
 use axum::{
         Router,
-        extract::{ConnectInfo, Extension, Form, Path, State},
+        extract::{ConnectInfo, Extension, Form, Path, Query, State},
         http::{HeaderMap, HeaderValue, StatusCode, header},
         middleware,
         response::{Html, IntoResponse, Redirect, Response},
@@ -9,13 +9,17 @@ use axum::{
 };
 use serde::Deserialize;
 use std::{
+        collections::BTreeMap,
         net::SocketAddr,
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::auth;
-use crate::domain::{Device, DeviceMinuteStat, DomainTrafficSummary, Flow, normalize_display_name};
+use crate::domain::{
+        Device, DeviceMinuteStat, DomainMinuteStat, DomainTrafficSummary, Flow,
+        normalize_display_name,
+};
 use crate::state::AppState;
 
 #[derive(Template)]
@@ -23,6 +27,7 @@ use crate::state::AppState;
 struct LoginTemplate {
         csrf_token: String,
         error: String,
+        collector_status: String,
 }
 
 #[derive(Template)]
@@ -33,6 +38,8 @@ struct DashboardTemplate {
         device_count: usize,
         total_upload: String,
         total_download: String,
+        upload_meter: u8,
+        download_meter: u8,
         active_flow_count: usize,
         devices: Vec<DeviceRow>,
 }
@@ -41,6 +48,7 @@ struct DashboardTemplate {
 #[template(path = "devices.html")]
 struct DevicesTemplate {
         csrf_token: String,
+        collector_status: String,
         devices: Vec<DeviceRow>,
 }
 
@@ -52,6 +60,17 @@ struct DeviceDetailTemplate {
         collector_status: String,
         traffic: Vec<TrafficRow>,
         domains: Vec<DomainRow>,
+        show_domain_trend: bool,
+        selected_domain: String,
+        domain_traffic: Vec<TrafficRow>,
+        domain_window_label: String,
+        domain_24h_href: String,
+        domain_30d_href: String,
+        domain_24h_active: bool,
+        domain_30d_active: bool,
+        device_total_meter: u8,
+        device_upload_meter: u8,
+        device_download_meter: u8,
         flows: Vec<FlowRow>,
 }
 
@@ -82,11 +101,63 @@ struct TrafficRow {
 
 struct DomainRow {
         domain: String,
+        trend_href: String,
+        selected: bool,
         upload_bytes: String,
         download_bytes: String,
         total_bytes: String,
         source: String,
         confidence: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DomainTrendWindow {
+        Hours24,
+        Days30,
+}
+
+impl DomainTrendWindow {
+        fn parse(value: Option<&str>) -> Result<Self, StatusCode> {
+                match value.unwrap_or("24h") {
+                        "24h" => Ok(Self::Hours24),
+                        "30d" => Ok(Self::Days30),
+                        _ => Err(StatusCode::BAD_REQUEST),
+                }
+        }
+
+        fn query_value(self) -> &'static str {
+                match self {
+                        Self::Hours24 => "24h",
+                        Self::Days30 => "30d",
+                }
+        }
+
+        fn label(self) -> &'static str {
+                match self {
+                        Self::Hours24 => "24 小时 / 10 分钟桶",
+                        Self::Days30 => "30 天 / 6 小时桶",
+                }
+        }
+
+        fn duration_ms(self) -> i64 {
+                match self {
+                        Self::Hours24 => 24 * 60 * 60 * 1_000,
+                        Self::Days30 => 30 * 24 * 60 * 60 * 1_000,
+                }
+        }
+
+        fn bucket_ms(self) -> i64 {
+                match self {
+                        Self::Hours24 => 10 * 60 * 1_000,
+                        Self::Days30 => 6 * 60 * 60 * 1_000,
+                }
+        }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DeviceDetailQuery {
+        domain: Option<String>,
+        domain_window: Option<String>,
 }
 
 struct FlowRow {
@@ -275,7 +346,8 @@ async fn dashboard(
         headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
         let devices = build_device_rows(&state.observation)?;
-        let (total_upload, total_download, active_flow_count) = summarize_device_rows(&devices);
+        let (total_upload, total_download, upload_meter, download_meter, active_flow_count) =
+                summarize_device_rows(&devices);
 
         let csrf_token = page_csrf_token(&headers);
         render_page(
@@ -286,6 +358,8 @@ async fn dashboard(
                         device_count: devices.len(),
                         total_upload,
                         total_download,
+                        upload_meter,
+                        download_meter,
                         active_flow_count,
                         devices,
                 },
@@ -303,6 +377,7 @@ async fn devices(
                 &state,
                 DevicesTemplate {
                         csrf_token: csrf_token.clone(),
+                        collector_status: state.collector_health.snapshot().state,
                         devices: build_device_rows(&state.observation)?,
                 },
                 &csrf_token,
@@ -313,8 +388,11 @@ async fn devices(
 async fn device_detail(
         State(state): State<AppState>,
         Path(mac_address): Path<String>,
+        Query(query): Query<DeviceDetailQuery>,
         headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
+        let domain_window = DomainTrendWindow::parse(query.domain_window.as_deref())?;
+        let selected_domain = query.domain.filter(|domain| !domain.is_empty());
         let device = state
                 .observation
                 .device(&mac_address)
@@ -332,7 +410,31 @@ async fn device_detail(
                 .observation
                 .device_domain_top(&mac_address)
                 .map_err(service_error)?;
+        let domain_traffic = match selected_domain.as_deref() {
+                Some(domain) => state
+                        .observation
+                        .domain_traffic(&mac_address, domain)
+                        .map_err(service_error)?,
+                None => Vec::new(),
+        };
         let device_row = build_device_row(&state.observation, device)?;
+        let device_total = device_row
+                .upload_total
+                .saturating_add(device_row.download_total);
+        let device_total_meter = u8::from(device_total > 0) * 100;
+        let device_upload_meter = relative_meter(device_row.upload_total, device_total);
+        let device_download_meter = relative_meter(device_row.download_total, device_total);
+        let domain_24h_href =
+                selected_domain
+                        .as_deref()
+                        .map(|domain| {
+                                domain_trend_href(&mac_address, domain, DomainTrendWindow::Hours24)
+                        })
+                        .unwrap_or_default();
+        let domain_30d_href = selected_domain
+                .as_deref()
+                .map(|domain| domain_trend_href(&mac_address, domain, DomainTrendWindow::Days30))
+                .unwrap_or_default();
 
         let csrf_token = page_csrf_token(&headers);
         render_page(
@@ -342,7 +444,23 @@ async fn device_detail(
                         device: device_row,
                         collector_status: state.collector_health.snapshot().state,
                         traffic: build_traffic_rows(traffic),
-                        domains: domains.into_iter().map(domain_row).collect(),
+                        domains: domains
+                                .into_iter()
+                                .map(|domain| {
+                                        domain_row(&mac_address, selected_domain.as_deref(), domain)
+                                })
+                                .collect(),
+                        show_domain_trend: selected_domain.is_some(),
+                        selected_domain: selected_domain.unwrap_or_default(),
+                        domain_traffic: build_domain_traffic_rows(domain_traffic, domain_window),
+                        domain_window_label: domain_window.label().to_owned(),
+                        domain_24h_href,
+                        domain_30d_href,
+                        domain_24h_active: domain_window == DomainTrendWindow::Hours24,
+                        domain_30d_active: domain_window == DomainTrendWindow::Days30,
+                        device_total_meter,
+                        device_upload_meter,
+                        device_download_meter,
                         flows: flows.into_iter().map(flow_row).collect(),
                 },
                 &csrf_token,
@@ -450,7 +568,7 @@ fn build_device_row(
         })
 }
 
-fn summarize_device_rows(devices: &[DeviceRow]) -> (String, String, usize) {
+fn summarize_device_rows(devices: &[DeviceRow]) -> (String, String, u8, u8, usize) {
         let mut total_upload = 0_u64;
         let mut total_download = 0_u64;
         let mut active_flow_count = 0_usize;
@@ -459,11 +577,21 @@ fn summarize_device_rows(devices: &[DeviceRow]) -> (String, String, usize) {
                 total_download = total_download.saturating_add(device.download_total);
                 active_flow_count = active_flow_count.saturating_add(device.flow_count);
         }
+        let max_traffic = total_upload.max(total_download);
         (
                 format_bytes(total_upload),
                 format_bytes(total_download),
+                relative_meter(total_upload, max_traffic),
+                relative_meter(total_download, max_traffic),
                 active_flow_count,
         )
+}
+
+fn relative_meter(value: u64, maximum: u64) -> u8 {
+        if maximum == 0 {
+                return 0;
+        }
+        ((value as f64 / maximum as f64) * 100.0).round() as u8
 }
 
 fn build_traffic_rows(stats: Vec<DeviceMinuteStat>) -> Vec<TrafficRow> {
@@ -500,15 +628,90 @@ fn build_traffic_rows(stats: Vec<DeviceMinuteStat>) -> Vec<TrafficRow> {
                 .collect()
 }
 
-fn domain_row(domain: DomainTrafficSummary) -> DomainRow {
+fn domain_row(
+        mac_address: &str,
+        selected_domain: Option<&str>,
+        domain: DomainTrafficSummary,
+) -> DomainRow {
+        let trend_href = domain_trend_href(mac_address, &domain.domain, DomainTrendWindow::Hours24);
+        let selected = selected_domain == Some(domain.domain.as_str());
         DomainRow {
                 domain: domain.domain,
+                trend_href,
+                selected,
                 upload_bytes: format_bytes(domain.upload_bytes),
                 download_bytes: format_bytes(domain.download_bytes),
                 total_bytes: format_bytes(domain.total_bytes),
                 source: domain.source.as_str().to_owned(),
                 confidence: domain.confidence.as_str().to_owned(),
         }
+}
+
+fn build_domain_traffic_rows(
+        stats: Vec<DomainMinuteStat>,
+        window: DomainTrendWindow,
+) -> Vec<TrafficRow> {
+        build_domain_traffic_rows_at(stats, window, now_ms())
+}
+
+fn build_domain_traffic_rows_at(
+        stats: Vec<DomainMinuteStat>,
+        window: DomainTrendWindow,
+        now_ms: i64,
+) -> Vec<TrafficRow> {
+        let cutoff = now_ms.saturating_sub(window.duration_ms());
+        let bucket_ms = window.bucket_ms();
+        let mut buckets = BTreeMap::<i64, (u64, u64)>::new();
+        for stat in stats.into_iter().filter(|stat| stat.minute_ms >= cutoff) {
+                let bucket = stat.minute_ms - stat.minute_ms.rem_euclid(bucket_ms);
+                let totals = buckets.entry(bucket).or_default();
+                totals.0 = totals.0.saturating_add(stat.upload_bytes);
+                totals.1 = totals.1.saturating_add(stat.download_bytes);
+        }
+
+        let max_total = buckets
+                .values()
+                .map(|(upload, download)| upload.saturating_add(*download))
+                .max()
+                .unwrap_or(0);
+        buckets.into_iter()
+                .map(|(bucket, (upload_bytes, download_bytes))| {
+                        let total = upload_bytes.saturating_add(download_bytes);
+                        let bar_width = if max_total == 0 {
+                                0
+                        } else {
+                                ((total as f64 / max_total as f64) * 100.0).round() as u8
+                        };
+                        TrafficRow {
+                                minute: format_timestamp(bucket),
+                                upload_bytes: format_bytes(upload_bytes),
+                                download_bytes: format_bytes(download_bytes),
+                                total_bytes: format_bytes(total),
+                                bar_width,
+                        }
+                })
+                .collect()
+}
+
+fn domain_trend_href(mac_address: &str, domain: &str, window: DomainTrendWindow) -> String {
+        format!(
+                "/devices/{mac_address}?domain={}&domain_window={}",
+                percent_encode_component(domain),
+                window.query_value()
+        )
+}
+
+fn percent_encode_component(value: &str) -> String {
+        let mut encoded = String::with_capacity(value.len());
+        for byte in value.bytes() {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                        encoded.push(char::from(byte));
+                } else {
+                        use std::fmt::Write;
+                        write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+                }
+        }
+        encoded
 }
 
 fn flow_row(flow: Flow) -> FlowRow {
@@ -589,9 +792,12 @@ fn service_error(error: rusqlite::Error) -> StatusCode {
         StatusCode::INTERNAL_SERVER_ERROR
 }
 
-/// 返回内嵌的应用 CSS。
-async fn stylesheet() -> &'static str {
-        include_str!("../static/app.css")
+/// 返回内嵌的应用 CSS，并显式声明样式表 MIME 类型。
+async fn stylesheet() -> impl IntoResponse {
+        (
+                [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                include_str!("../static/app.css"),
+        )
 }
 
 /// 将 Askama 模板渲染为 HTML，失败时返回 500。
@@ -626,7 +832,11 @@ fn render_login(
         status: StatusCode,
 ) -> Result<Response, StatusCode> {
         let csrf_cookie = csrf_token.clone();
-        let html = render(LoginTemplate { csrf_token, error })?;
+        let html = render(LoginTemplate {
+                csrf_token,
+                error,
+                collector_status: state.collector_health.snapshot().state,
+        })?;
         let mut response = (status, html).into_response();
         auth::append_cookie(
                 &mut response,
@@ -666,4 +876,74 @@ fn login_source(headers: &HeaderMap, remote: Option<SocketAddr>) -> String {
                 })
                 .unwrap_or("unknown")
                 .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+        use super::*;
+        use crate::domain::{DomainConfidence, DomainSource};
+
+        fn domain_stat(minute_ms: i64, upload_bytes: u64, download_bytes: u64) -> DomainMinuteStat {
+                DomainMinuteStat {
+                        mac_address: "aa:bb:cc:dd:ee:ff".to_owned(),
+                        domain: "example.com".to_owned(),
+                        minute_ms,
+                        upload_bytes,
+                        download_bytes,
+                        source: DomainSource::Dns,
+                        confidence: DomainConfidence::High,
+                }
+        }
+
+        #[test]
+        fn domain_trend_uses_ten_minute_buckets_for_24_hours() {
+                let rows = build_domain_traffic_rows_at(
+                        vec![
+                                domain_stat(600_000, 100, 200),
+                                domain_stat(660_000, 300, 400),
+                                domain_stat(1_200_000, 50, 50),
+                        ],
+                        DomainTrendWindow::Hours24,
+                        1_300_000,
+                );
+
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].minute, "600.000 UTC");
+                assert_eq!(rows[0].upload_bytes, "400 B");
+                assert_eq!(rows[0].download_bytes, "600 B");
+                assert_eq!(rows[0].total_bytes, "1000 B");
+                assert_eq!(rows[0].bar_width, 100);
+                assert_eq!(rows[1].total_bytes, "100 B");
+        }
+
+        #[test]
+        fn domain_trend_uses_six_hour_buckets_for_30_days() {
+                let bucket = 6 * 60 * 60 * 1_000;
+                let rows = build_domain_traffic_rows_at(
+                        vec![
+                                domain_stat(bucket, 10, 20),
+                                domain_stat(bucket + 60_000, 30, 40),
+                                domain_stat(bucket * 2, 5, 5),
+                        ],
+                        DomainTrendWindow::Days30,
+                        bucket * 2 + 1,
+                );
+
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].upload_bytes, "40 B");
+                assert_eq!(rows[0].download_bytes, "60 B");
+                assert_eq!(rows[1].total_bytes, "10 B");
+        }
+
+        #[test]
+        fn domain_href_percent_encodes_query_component() {
+                assert_eq!(
+                        domain_trend_href(
+                                "aa:bb:cc:dd:ee:ff",
+                                "例子.test/a+b",
+                                DomainTrendWindow::Days30,
+                        ),
+                        "/devices/aa:bb:cc:dd:ee:ff?domain=%E4%BE%8B%E5%AD%90.test%2Fa%2Bb&domain_window=30d"
+                );
+        }
 }

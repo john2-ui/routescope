@@ -3,53 +3,50 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>概览 · RouteScope</title>
+  <title>overview · RouteScope</title>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <header class="header">
+  <header class="terminal-header">
     <a class="brand" href="/">RouteScope</a>
-    <nav>
-      <a href="/">概览</a><a href="/devices">设备</a>
-      <form method="post" action="/logout" class="logout-form">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit">退出</button>
-      </form>
-    </nav>
+    <span class="header-context">overview</span>
+    <span class="header-spacer"></span>
+    <span class="status status-{{ collector_status }}">[collector: {{ collector_status }}]</span>
+    <nav aria-label="主导航"><a class="active" href="/">F1 Overview</a><a href="/devices">F2 Devices</a></nav>
+    <form method="post" action="/logout" class="logout-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit">F10 Quit</button>
+    </form>
   </header>
-  <main>
-    <p class="eyebrow">网络流量观测</p>
-    <h1>概览</h1>
-    <p class="status-line">采集器状态：<span class="badge badge-{{ collector_status }}">{{ collector_status }}</span></p>
-    <section class="metric-grid">
-      <article class="metric-card"><span>设备</span><strong>{{ device_count }}</strong></article>
-      <article class="metric-card"><span>最近流量上行</span><strong>{{ total_upload }}</strong></article>
-      <article class="metric-card"><span>最近流量下行</span><strong>{{ total_download }}</strong></article>
-      <article class="metric-card"><span>最近连接</span><strong>{{ active_flow_count }}</strong></article>
+  <main class="terminal-main">
+    <section class="terminal-window" aria-labelledby="summary-title">
+      <div class="terminal-title"><span id="summary-title">[ gateway summary ]</span><span>live / last 24h</span></div>
+      <div class="meter-grid">
+        <div class="meter meter-value"><span>Devices</span><strong>{{ device_count }}</strong></div>
+        <div class="meter"><span>Upload</span><strong class="traffic-up">{{ total_upload }}</strong><i class="meter-up" style="--meter: {{ upload_meter }}%"></i></div>
+        <div class="meter"><span>Download</span><strong class="traffic-down">{{ total_download }}</strong><i class="meter-down" style="--meter: {{ download_meter }}%"></i></div>
+        <div class="meter meter-value"><span>Flows</span><strong>{{ active_flow_count }}</strong></div>
+      </div>
     </section>
     {% if devices.is_empty() %}
-    <section class="empty-state">
-      <h2>尚无采集数据</h2>
-      <p>启动模拟采集器或 TC eBPF 采集器后，设备流量会自动出现在这里。</p>
+    <section class="terminal-window empty-state">
+      <div class="terminal-title"><span>[ devices ]</span><span>0 rows</span></div>
+      <p>-- no observations --</p>
+      <small>Enable the simulator or TC eBPF collector to begin.</small>
     </section>
     {% else %}
-    <section class="panel">
-      <div class="section-heading">
-        <h2>设备实时概览</h2>
-        <a href="/devices">查看全部设备</a>
-      </div>
+    <section class="terminal-window">
+      <div class="terminal-title"><span>[ device processes ]</span><a href="/devices">all devices →</a></div>
       <div class="table-wrap">
-        <table>
-          <thead>
-            <tr><th>设备</th><th>当前 IP</th><th>连接</th><th>上下行</th><th>域名 Top</th><th>最近观测</th></tr>
-          </thead>
+        <table class="terminal-table">
+          <thead><tr><th>DEVICE / MAC</th><th>IP</th><th>FLOWS</th><th>UP / DOWN</th><th>TOP DOMAIN</th><th>LAST SEEN</th></tr></thead>
           <tbody>
           {% for device in devices %}
             <tr>
-              <td><a href="/devices/{{ device.mac_address }}"><strong>{{ device.display_name }}</strong></a><small>{{ device.mac_address }}</small></td>
+              <td><a href="/devices/{{ device.mac_address }}">{{ device.display_name }}</a><small>{{ device.mac_address }}</small></td>
               <td>{{ device.current_ip }}</td>
               <td>{{ device.flow_count }}</td>
-              <td><span class="traffic-up">{{ device.upload_bytes }}</span><br><span class="traffic-down">{{ device.download_bytes }}</span></td>
+              <td><span class="traffic-up">↑ {{ device.upload_bytes }}</span><small class="traffic-down">↓ {{ device.download_bytes }}</small></td>
               <td>{{ device.top_domain }}<small>{{ device.top_domain_meta }}</small></td>
               <td>{{ device.last_seen }}</td>
             </tr>
@@ -60,5 +57,6 @@
     </section>
     {% endif %}
   </main>
+  <footer class="keybar"><a href="/">F1 Overview</a><a href="/devices">F2 Devices</a><span>F5 Refresh</span><span>F10 Quit</span></footer>
 </body>
 </html>

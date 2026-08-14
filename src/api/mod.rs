@@ -9,7 +9,10 @@ use axum::{
 use serde::Deserialize;
 
 use crate::auth;
-use crate::domain::{Device, DeviceMinuteStat, DomainTrafficSummary, Flow, normalize_display_name};
+use crate::domain::{
+        Device, DeviceMinuteStat, DomainMinuteStat, DomainTrafficSummary, Flow,
+        normalize_display_name,
+};
 use crate::state::AppState;
 
 /// 注册公开 API 路由（健康检查）。
@@ -27,6 +30,10 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
                 .route("/api/v1/devices/{mac_address}/traffic", get(device_traffic))
                 .route("/api/v1/devices/{mac_address}/flows", get(device_flows))
                 .route("/api/v1/devices/{mac_address}/domains", get(device_domains))
+                .route(
+                        "/api/v1/devices/{mac_address}/domains/{domain}/traffic",
+                        get(device_domain_traffic),
+                )
                 .route(
                         "/api/v1/devices/{mac_address}/name",
                         post(update_device_name),
@@ -131,6 +138,21 @@ async fn device_domains(
                 .map(Json)
                 .map_err(|err| {
                         eprintln!("device_domains failed: {err}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                })
+}
+
+/// 返回某设备、某域名在聚合保留窗口内的原始分钟流量序列。
+async fn device_domain_traffic(
+        State(state): State<AppState>,
+        Path((mac_address, domain)): Path<(String, String)>,
+) -> Result<Json<Vec<DomainMinuteStat>>, StatusCode> {
+        require_device(&state, &mac_address)?;
+        state.observation
+                .domain_traffic(&mac_address, &domain)
+                .map(Json)
+                .map_err(|err| {
+                        eprintln!("device_domain_traffic failed: {err}");
                         StatusCode::INTERNAL_SERVER_ERROR
                 })
 }

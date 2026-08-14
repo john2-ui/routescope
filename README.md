@@ -8,7 +8,8 @@ Linux 软路由流量观测与统计工具。
 设备名称管理以及可选的模拟采集闭环。第一版 TC eBPF 采集器已经接入，可在 Linux namespace
 拓扑中采集 LAN ingress/egress 上的 IPv4 TCP/UDP 双向 Flow，并可选通过只读
 conntrack netlink 快照补齐 NAT 关联；可选的本地 DNS UDP/TCP 转发与 IPv4 域名归因
-已经接入，本地管理员账户认证、会话和 CSRF 防护也已经接入。
+已经接入，本地管理员账户认证、会话和 CSRF 防护也已经接入。管理页面采用紧凑的
+htop/Linux 终端风格，并支持查询单设备、单域名最近 30 天的分钟流量趋势。
 
 - `GET /healthz` 可用于健康检查；
 - `GET /readyz` 用于判断存储和已启用采集器是否已完成启动；
@@ -33,6 +34,8 @@ conntrack netlink 快照补齐 NAT 关联；可选的本地 DNS UDP/TCP 转发�
 - `/`、`/devices` 和 `/devices/<mac>` 已接入 SQLite 中的设备、Flow、分钟趋势与域名
   Top 数据；设备列表支持手动命名，管理 API 为
   `POST /api/v1/devices/<mac>/name`（需要 `X-CSRF-Token`）。
+- `GET /api/v1/devices/<mac>/domains/<domain>/traffic` 返回聚合保留期内按时间升序排列的
+  原始域名分钟桶；设备详情页可从域名 Top 进入 24 小时或 30 天趋势视图。
 - SQLite 使用 `PRAGMA user_version` 执行 schema 迁移，Flow 批次在单事务中写入；可用
   `make benchmark` 或 `cargo run --release -- benchmark-storage 10000` 做离线写入基准。
 - 收到 SIGINT/SIGTERM 后会停止采集、DNS、清理后台任务并等待 HTTP 连接，超时由
@@ -109,5 +112,3 @@ templates/     Askama HTML 模板
 static/        CSS 等静态资源
 config/        示例配置
 ```
-
-更多产品边界、数据保留期和验收标准见 [架构文档](docs/architecture.md)。

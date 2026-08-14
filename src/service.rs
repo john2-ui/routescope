@@ -1,6 +1,6 @@
 //! Application use cases over the persistence layer.
 
-use crate::domain::{Device, DeviceMinuteStat, DomainTrafficSummary, Flow};
+use crate::domain::{Device, DeviceMinuteStat, DomainMinuteStat, DomainTrafficSummary, Flow};
 use crate::storage::{RouteScopeRepository, SqliteRepository};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -54,6 +54,17 @@ impl ObservationService {
         ) -> Result<Vec<DeviceMinuteStat>, rusqlite::Error> {
                 let cutoff = now_ms() - i64::from(self.aggregate_retention_days) * 86_400_000;
                 self.repo.list_device_minute_stats(mac_address, cutoff)
+        }
+
+        /// 查询某设备、某域名在聚合保留窗口内的原始分钟流量序列。
+        pub fn domain_traffic(
+                &self,
+                mac_address: &str,
+                domain: &str,
+        ) -> Result<Vec<DomainMinuteStat>, rusqlite::Error> {
+                let cutoff = now_ms() - i64::from(self.aggregate_retention_days) * 86_400_000;
+                self.repo
+                        .list_domain_minute_stats(mac_address, domain, cutoff)
         }
 
         /// 查询某设备域名流量 Top（使用 flow 保留窗口，与近期连接视图对齐）。
